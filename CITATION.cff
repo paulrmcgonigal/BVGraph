@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "BVGraph"
+message: "If you use this software, please cite the associated publication."
+type: software
+
+authors:
+  - family-names: McGonigal
+    given-names: Paul
+
+version: 1.0
+date-released: 2026
+
+repository-code: "https://github.com/paulrmcgonigal/BVGraph"
+
+abstract: >
+  BVGraph is a computational method for generating mirror-symmetric
+  network layouts for bullvalene systems, with 2D and 3D layout capabilities.
