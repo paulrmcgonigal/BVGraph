@@ -133,14 +133,9 @@ short-range repulsion, and a one-sided radial container. Exact mirror symmetry
 is reimposed during relaxation so the final embedding remains chemically
 consistent.
 
-## Notes
+## Requirements
 
-- `BVGraph2D.py` is the current 2D entry point. Some older helper scripts in
-  the repository still reference legacy filenames such as
-  `BVGraph.py` or `BVGraph2D_fastmode_optimise.py`.
-- The 2D script reads `TS_Energy`-style edge columns if present in the CSV, but
-  the present CSV-loading path does not use edge energies in the layout itself.
-- For reproducible runs, keep `--seed` fixed.
+- Python 3.8+, NetworkX, NumPy, and pandas; BVGraph3D also benefits from SciPy and Numba on larger graphs.
 
 ## Citation and license
 
