@@ -37,7 +37,7 @@ Nodes CSV:
   Barcode_Normalized, Enantiomer_Suggested
 
 Edges CSV:
-- required columns: Source and Target (case-insensitive)
+- required columns: source and target (case-insensitive)
 - alternative short names s and t are also accepted
 
 The script runs its own annotation pass from the node IDs, then attaches the
