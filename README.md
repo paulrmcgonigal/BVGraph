@@ -1,68 +1,54 @@
-BVGraph: Mirror-Preserving Layouts for Bullvalene Isomer Networks
-=================================================================
+# BVGraph: mirror-preserving layouts for bullvalene isomer networks
 
-## Overview
+BVGraph generates symmetry-aware two- and three-dimensional layouts for
+bullvalene isomer networks.  It is designed for barcode-labelled networks that
+contain achiral isomers and pairs of enantiomeric isomers.
 
-BVGraph is a two-script workflow for generating symmetry-aware network layouts
-for bullvalene isomer graphs.
+`BVGraph2D.py` creates a two-dimensional layout with exact left/right mirror
+symmetry.  `BVGraph3D.py` converts a completed two-dimensional layout into a
+mirror-preserving three-dimensional embedding.
 
-- `BVGraph2D.py` builds a 2D mirror-preserving layout from node and edge CSV
-  files.
-- `BVGraph3D.py` converts a completed 2D layout into a 3D embedding while
-  preserving enantiomeric symmetry.
+## Contents
 
-The current project layout is centered on these two scripts. The older helper
-shell scripts in this folder and in `example/` may still contain legacy script
-names and should be treated as templates rather than authoritative entry
-points.
+- `BVGraph2D.py` — two-dimensional layout generator.
+- `BVGraph3D.py` — three-dimensional embedding generator.
+- `README_BVGraph2D.txt` — detailed two-dimensional input, method, and option
+  reference.
+- `README_BVGraph3D.txt` — detailed three-dimensional usage reference.
+- `example/0000001123/` — example input and output files.
+- `CITATION.cff` and `LICENSE` — citation metadata and MIT license.
 
-## Repository contents
+## Installation
 
-- `BVGraph2D.py`: 2D layout generator for bullvalene networks
-- `BVGraph3D.py`: 3D embedding tool for BVGraph outputs
-- `README_BVGraph2D.txt`: detailed usage notes for the 2D script
-- `README_BVGraph3D.txt`: detailed usage notes for the 3D script
-- `example/0000001123/`: bundled example input and output files
-- `CITATION.cff`: citation metadata
-- `LICENSE.txt`: license text
-
-## Dependencies
-
-Minimum:
+Python 3.8 or later is required.  Install the packages used by the 2D workflow:
 
 ```bash
 pip install networkx numpy pandas
 ```
 
-Recommended for `BVGraph3D.py` on larger graphs:
+SciPy is required for the NetworkX spring-layout calculation on larger graphs.
+SciPy and Numba are optional accelerators for larger 3D calculations:
 
 ```bash
 pip install scipy numba
 ```
 
-## Input model
+## Input files
 
-### `BVGraph2D.py`
+`BVGraph2D.py` reads a node CSV and an edge CSV.
 
-Inputs are two CSV files:
+- The node table requires `id` and may contain an `Energy` column plus existing
+  barcode or enantiomer annotations.
+- The edge table requires `Source` and `Target` columns, matched
+  case-insensitively.  `s` and `t` are accepted aliases.
 
-- nodes CSV: must contain an `id` column; `Energy` is optional
-- edges CSV: must contain `Source` and `Target` columns (case-insensitive)
+Barcode annotations, chirality, and enantiomer partners are derived from the
+node IDs before the layout is constructed.  Any matching annotation columns in
+the node table are retained as graph attributes.
 
-`BVGraph2D.py` automatically annotates nodes from the barcode-style node IDs,
-including normalized barcodes, chirality classification, and suggested
-enantiomer partners. If the nodes table already includes matching annotation
-columns, those are attached as node attributes as well.
+## Standard 2D and 3D workflow
 
-### `BVGraph3D.py`
-
-Input is a GEXF or XGMML graph that already contains 2D coordinates produced by
-the 2D workflow. An optional nodes CSV can be supplied to reinforce chirality
-and enantiomer annotations during pair detection.
-
-## Typical workflow
-
-### 1. Generate a 2D layout
+Create a 2D layout:
 
 ```bash
 python BVGraph2D.py \
@@ -71,12 +57,11 @@ python BVGraph2D.py \
   --out example/0000001123/my_layout.gexf \
   --out-xgmml example/0000001123/my_layout.xgmml \
   --out-nodes-csv example/0000001123/nodes_coords.csv \
-  --annot-out example/0000001123/annotated_nodes.csv \
-  --dump-sides example/0000001123/sides.csv \
+  --out-edges-csv example/0000001123/edges_out.csv \
   --verbose
 ```
 
-### 2. Convert the 2D layout into 3D
+Create a 3D embedding from that layout:
 
 ```bash
 python BVGraph3D.py \
@@ -86,59 +71,60 @@ python BVGraph3D.py \
   --verbose
 ```
 
+## Energy-aware 2D layouts
+
+When constructing a new layout (rather than resuming coordinates), BVGraph2D
+uses a topological NetworkX spring layout and treats all non-self-loop edges
+uniformly in its geometric edge-length term by default. If transition-state
+energies are available, Boltzmann weighting can make lower-barrier connections
+exert stronger relative attraction.
+
+For `--edge-weighting boltzmann`, provide the following default columns:
+
+- node CSV: `Relative Energy (kJ/mol)`
+- edge CSV: `Relative TS Energy (kJ/mol)`
+
+Both columns must be in kJ mol⁻¹ and share the globally lowest-energy
+ground-state node as their zero.  For an edge between `u` and `v`, BVGraph2D
+uses the activation barrier:
+
+```text
+B = E_TS - min(E_u, E_v)
+```
+
+Run an energy-aware layout with:
+
+```bash
+python BVGraph2D.py \
+  --nodes nodes.csv \
+  --edges edges.csv \
+  --out weighted_layout.gexf \
+  --out-edges-csv weighted_edges.csv \
+  --edge-weighting boltzmann \
+  --temperature-k 298.15 \
+  --spring-weight-floor-ratio 0.05 \
+  --verbose
+```
+
+Without `--edge-weighting boltzmann`, energy columns are retained as metadata
+when present but do not guide the initial spring layout or layout objective.
+The detailed 2D guide describes validation, missing-energy handling, objective
+weights, progressive separation, checkpointing, and all exports.
+
 ## Outputs
 
-### `BVGraph2D.py`
+BVGraph2D writes a GEXF layout with `viz:position` coordinates.  Optional
+outputs include Cytoscape-compatible XGMML, node-coordinate CSV, edge-metadata
+CSV, barcode annotations, side assignments, checkpoint GEXF files, restart
+JSON, and a best-layout checkpoint.
 
-Required output:
-
-- GEXF with `viz:position` coordinates for Gephi
-
-Optional outputs:
-
-- XGMML with node graphics coordinates for Cytoscape
-- nodes CSV with `id`, `x`, `y`, `Barcode_Normalized`, `Chirality`, `Energy`,
-  `DeltaE`, and `Enantiomer_Id`
-- edge CSV with `Source`, `Target`, and `TS_Energy`
-- annotated nodes CSV from the internal barcode annotation step
-- side assignment CSV describing `left`, `right`, or `axis` placement
-- checkpoint GEXF files during refinement
-
-### `BVGraph3D.py`
-
-- GEXF with 3D `x`, `y`, `z` coordinates written both as node attributes and
-  as `viz:position`
-
-## Method summary
-
-### BVGraph2D
-
-The 2D script builds a simple undirected NetworkX graph, infers chiral pairs
-and achiral nodes from the bullvalene barcode scheme, partitions paired
-representatives across left and right hemispheres, and arranges achiral nodes on
-the central axis. It then refines the layout using multiple symmetry-preserving
-move classes, including pair swaps, achiral axis ordering adjustments,
-enantiomer lateral swaps, optional chiral relaxation, and post-processing for
-node spacing and edge clearance.
-
-The current version supports several crossing-evaluation strategies via
-`--crossing-mode`, including exact and sampled estimates for faster optimization
-on larger graphs.
-
-### BVGraph3D
-
-The 3D script starts from a completed 2D layout, initializes achiral nodes on
-the mirror plane, and optimizes representative coordinates using spring forces,
-short-range repulsion, and a one-sided radial container. Exact mirror symmetry
-is reimposed during relaxation so the final embedding remains chemically
-consistent.
-
-## Requirements
-
-- Python 3.8+, NetworkX, NumPy, and pandas; BVGraph3D also benefits from SciPy and Numba on larger graphs.
+In Boltzmann mode, exported edges include the selected relative TS energy,
+activation barrier, energy-data status, normalized layout spring weight, and
+number of merged input edge rows.  BVGraph3D writes a GEXF containing node
+`x`, `y`, and `z` attributes and three-dimensional `viz:position` coordinates.
 
 ## Citation and license
 
-Please cite the associated publication and/or use the metadata in
-`CITATION.cff` when referencing this software. The project is distributed under
-the license given in `LICENSE.txt`.
+Please cite the associated publication and/or use `CITATION.cff` when
+referencing this software.  BVGraph is distributed under the MIT license in
+`LICENSE`.

@@ -31,6 +31,8 @@ Author: Paul McGonigal
 """
 from __future__ import annotations
 import argparse
+import copy
+import json
 import math
 import random
 import time
@@ -40,6 +42,9 @@ import pandas as pd
 import numpy as np
 import networkx as nx
 from pathlib import Path
+
+R_KJ_MOL_K = 0.00831446261815324
+LAYOUT_EDGE_OBJECTIVE_SCOPE = "all"
 
 # ---------------------------
 # Utilities
@@ -112,28 +117,110 @@ def annotate_nodes(nodes_df: pd.DataFrame, id_col="id") -> pd.DataFrame:
 # ---------------------------
 # Graph IO & attach annotations
 # ---------------------------
-def read_graph(nodes_csv, edges_csv, id_col="id", energy_col="Energy"):
+def _find_column(df, requested, aliases=()):
+    """Return the actual column name using case-insensitive, whitespace-normalised matching."""
+    lookup = {str(c).strip().lower(): c for c in df.columns}
+    for candidate in (requested, *aliases):
+        if candidate is None:
+            continue
+        actual = lookup.get(str(candidate).strip().lower())
+        if actual is not None:
+            return actual
+    return None
+
+
+def _optional_finite_float(value, label, row_number):
+    """Parse a numeric CSV value, returning None for an empty cell."""
+    if value is None or pd.isna(value) or str(value).strip() == "":
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} at CSV row {row_number} is not numeric: {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{label} at CSV row {row_number} must be finite: {value!r}")
+    return parsed
+
+
+def read_graph(
+    nodes_csv,
+    edges_csv,
+    id_col="id",
+    energy_col="Energy",
+    edge_weighting="none",
+    node_energy_column="Relative Energy (kJ/mol)",
+    ts_energy_column="Relative TS Energy (kJ/mol)",
+    temperature_k=298.15,
+    spring_weight_floor_ratio=0.05,
+    missing_node_energy_policy="error",
+):
     nodes = pd.read_csv(nodes_csv, dtype={id_col: str})
     edges = pd.read_csv(edges_csv, dtype=str)
     nodes[id_col] = nodes[id_col].astype(str).apply(_clean_id)
+    weighting_enabled = str(edge_weighting).strip().lower() == "boltzmann"
+    if str(edge_weighting).strip().lower() not in {"none", "boltzmann"}:
+        raise ValueError("edge_weighting must be 'none' or 'boltzmann'.")
+    if temperature_k <= 0.0 or not math.isfinite(float(temperature_k)):
+        raise ValueError("temperature_k must be a positive finite number.")
+    floor_ratio = float(spring_weight_floor_ratio)
+    if not math.isfinite(floor_ratio) or not (0.0 < floor_ratio <= 1.0):
+        raise ValueError("spring_weight_floor_ratio must be greater than 0 and no greater than 1.")
+    missing_node_energy_policy = str(missing_node_energy_policy).strip().lower()
+    if missing_node_energy_policy not in {"error", "floor"}:
+        raise ValueError("missing_node_energy_policy must be 'error' or 'floor'.")
+
     # normalize edge column names case-insensitively
-    cols = {c.lower(): c for c in edges.columns}
-    src_col = cols.get('source', cols.get('s', None))
-    tgt_col = cols.get('target', cols.get('t', None))
-    ts_col = cols.get('ts_energy', cols.get('ts', None))
+    src_col = _find_column(edges, "source", aliases=("s",))
+    tgt_col = _find_column(edges, "target", aliases=("t",))
+    ts_col = _find_column(edges, ts_energy_column, aliases=("TS_Energy", "ts_energy", "ts"))
     if src_col is None or tgt_col is None:
         raise ValueError('Edges CSV must contain Source and Target columns (case-insensitive).')
+    if weighting_enabled and ts_col is None:
+        raise ValueError(
+            f"Edges CSV is missing transition-state energy column {ts_energy_column!r}. "
+            "Use --ts-energy-column to select a different heading."
+        )
     edges['Source'] = edges[src_col].astype(str).apply(_clean_id)
     edges['Target'] = edges[tgt_col].astype(str).apply(_clean_id)
 
     G = nx.Graph()
     # allow energy column case-insensitively
-    node_cols = {c.lower(): c for c in nodes.columns}
-    energy_col_actual = node_cols.get(energy_col.lower(), energy_col) if isinstance(energy_col, str) else energy_col
-    for _, r in nodes.iterrows():
+    energy_col_actual = _find_column(nodes, energy_col)
+    relative_energy_col = _find_column(nodes, node_energy_column)
+    if weighting_enabled and relative_energy_col is None:
+        raise ValueError(
+            f"Nodes CSV is missing relative-energy column {node_energy_column!r}. "
+            "Use --node-energy-column to select a different heading."
+        )
+    seen_node_ids = set()
+    for row_index, r in nodes.iterrows():
+        csv_row = int(row_index) + 2
         nid = _clean_id(r[id_col])
-        energy = float(r.get(energy_col_actual, 0.0))
-        G.add_node(nid, **{energy_col: energy})
+        if not nid:
+            raise ValueError(f"Node id at CSV row {csv_row} is empty.")
+        if nid in seen_node_ids:
+            raise ValueError(f"Duplicate node id {nid!r} at CSV row {csv_row}.")
+        seen_node_ids.add(nid)
+        relative_energy = _optional_finite_float(
+            r.get(relative_energy_col) if relative_energy_col is not None else None,
+            node_energy_column,
+            csv_row,
+        )
+        if weighting_enabled and relative_energy is None and missing_node_energy_policy == "error":
+            raise ValueError(f"{node_energy_column} is missing for node {nid!r} at CSV row {csv_row}.")
+        legacy_energy = _optional_finite_float(
+            r.get(energy_col_actual) if energy_col_actual is not None else None,
+            energy_col,
+            csv_row,
+        )
+        energy = relative_energy if relative_energy is not None else (legacy_energy if legacy_energy is not None else 0.0)
+        node_attrs = {energy_col: float(energy)}
+        if relative_energy is not None:
+            node_attrs["Relative_Energy"] = float(relative_energy)
+            node_attrs["Energy_Data_Status"] = "complete"
+        else:
+            node_attrs["Energy_Data_Status"] = "missing_node_energy"
+        G.add_node(nid, **node_attrs)
         # placeholders for annotation keys
         for k in ["Chirality", "Enantiomer_Id", "Barcode_Normalized", "Enantiomer_Suggested"]:
             if k in nodes.columns:
@@ -145,13 +232,115 @@ def read_graph(nodes_csv, edges_csv, id_col="id", energy_col="Energy"):
         emin = min(energies.values())
         for n in G.nodes:
             G.nodes[n]["DeltaE"] = float(G.nodes[n][energy_col]) - float(emin)
-    for _, r in edges.iterrows():
+    grouped_edges = defaultdict(list)
+    skipped_unknown = 0
+    for row_index, r in edges.iterrows():
+        csv_row = int(row_index) + 2
         s, t = r["Source"], r["Target"]
         if s not in G or t not in G:
+            if weighting_enabled:
+                missing = [n for n in (s, t) if n not in G]
+                raise ValueError(
+                    f"Edge at CSV row {csv_row} references unknown node(s): {', '.join(repr(n) for n in missing)}."
+                )
+            skipped_unknown += 1
             continue
-        if G.has_edge(s, t):
-            continue
-        G.add_edge(s, t)
+        ts_energy = _optional_finite_float(
+            r.get(ts_col) if ts_col is not None else None,
+            ts_energy_column,
+            csv_row,
+        )
+        key = (s, t) if s <= t else (t, s)
+        grouped_edges[key].append({"row": csv_row, "ts_energy": ts_energy})
+
+    complete_barriers = []
+    pending_attrs = {}
+    for (u, v), records in grouped_edges.items():
+        finite_ts = [record["ts_energy"] for record in records if record["ts_energy"] is not None]
+        selected_ts = min(finite_ts) if finite_ts else None
+        attrs = {
+            "Layout_Spring_Weight": 0.0 if u == v else 1.0,
+            "Energy_Data_Status": "unweighted",
+            "Input_Edge_Rows": int(len(records)),
+        }
+        if selected_ts is not None:
+            attrs["Relative_TS_Energy"] = float(selected_ts)
+            attrs["TS_Energy"] = float(selected_ts)  # legacy export name
+        if weighting_enabled:
+            endpoint_energies = [
+                G.nodes[u].get("Relative_Energy"),
+                G.nodes[v].get("Relative_Energy"),
+            ]
+            endpoints_complete = all(value is not None for value in endpoint_energies)
+            barrier = None if selected_ts is None or not endpoints_complete else float(selected_ts) - min(
+                float(endpoint_energies[0]), float(endpoint_energies[1])
+            )
+            if barrier is not None and barrier < -1e-9:
+                rows = ", ".join(str(record["row"]) for record in records)
+                raise ValueError(
+                    f"Negative activation barrier {barrier:.6g} kJ/mol for edge {u!r}-{v!r} "
+                    f"from CSV row(s) {rows}. Check that node and TS energies share the same zero."
+                )
+            if barrier is not None:
+                barrier = max(0.0, barrier)
+                attrs["Activation_Barrier"] = float(barrier)
+                if u != v:
+                    complete_barriers.append(float(barrier))
+            if u == v:
+                attrs["Energy_Data_Status"] = "self_loop"
+            elif barrier is not None:
+                attrs["Energy_Data_Status"] = "complete"
+            elif selected_ts is None and not endpoints_complete:
+                attrs["Energy_Data_Status"] = "missing_ts_and_node_energy"
+            elif selected_ts is None:
+                attrs["Energy_Data_Status"] = "missing_ts_energy"
+            else:
+                attrs["Energy_Data_Status"] = "missing_node_energy"
+        elif selected_ts is not None:
+            attrs["Energy_Data_Status"] = "available_unweighted"
+        pending_attrs[(u, v)] = attrs
+
+    if weighting_enabled:
+        barrier_min = min(complete_barriers) if complete_barriers else None
+        raw_weights = {}
+        for (u, v), attrs in pending_attrs.items():
+            if u == v:
+                continue
+            barrier = attrs.get("Activation_Barrier")
+            if barrier is None or barrier_min is None:
+                raw_weights[(u, v)] = floor_ratio
+            else:
+                exponent = -(float(barrier) - float(barrier_min)) / (R_KJ_MOL_K * float(temperature_k))
+                raw_weights[(u, v)] = floor_ratio + (1.0 - floor_ratio) * math.exp(exponent)
+        raw_mean = sum(raw_weights.values()) / len(raw_weights) if raw_weights else 1.0
+        if raw_mean <= 0.0:
+            raw_mean = 1.0
+        for key, raw_weight in raw_weights.items():
+            pending_attrs[key]["Layout_Spring_Weight"] = float(raw_weight / raw_mean)
+
+    for (u, v), attrs in pending_attrs.items():
+        G.add_edge(u, v, **attrs)
+
+    if weighting_enabled:
+        complete = sum(1 for u, v, d in G.edges(data=True) if u != v and d["Energy_Data_Status"] == "complete")
+        missing_ts = sum(1 for u, v, d in G.edges(data=True) if u != v and d["Energy_Data_Status"] == "missing_ts_energy")
+        missing_node = sum(1 for u, v, d in G.edges(data=True) if u != v and d["Energy_Data_Status"] == "missing_node_energy")
+        missing_both = sum(1 for u, v, d in G.edges(data=True) if u != v and d["Energy_Data_Status"] == "missing_ts_and_node_energy")
+        self_loops = nx.number_of_selfloops(G)
+        duplicate_rows = sum(max(0, len(records) - 1) for records in grouped_edges.values())
+        print(
+            f"[ENERGY] mode=boltzmann complete_edges={complete} missing_ts_edges={missing_ts} "
+            f"missing_node_energy_edges={missing_node} missing_both_edges={missing_both} "
+            f"self_loops={self_loops} duplicate_rows={duplicate_rows} rejected_rows=0",
+            flush=True,
+        )
+        if not complete_barriers:
+            print(
+                "[WARN] No finite non-self-loop TS energies were found; all non-self-loop spring weights normalise to 1.",
+                flush=True,
+            )
+    elif skipped_unknown:
+        print(f"[WARN] Skipped {skipped_unknown} edge row(s) that reference unknown nodes.", flush=True)
     return G, nodes, edges
 
 def attach_annotation_from_df(G, annot_df, id_col="id"):
@@ -239,21 +428,25 @@ def rep_graph_from_partition(G, pairs, A_side):
     Grep = nx.Graph()
     for n in reps:
         Grep.add_node(n, **G.nodes[n])
-    for u, v in G.edges():
+    rep_edge_weights = defaultdict(list)
+    for u, v, data in G.edges(data=True):
         ru, rv = rep_of.get(u, u), rep_of.get(v, v)
         if ru in reps and rv in reps and ru != rv:
-            if Grep.has_edge(ru, rv):
-                continue
-            Grep.add_edge(ru, rv)
+            key = (ru, rv) if ru <= rv else (rv, ru)
+            rep_edge_weights[key].append(float(data.get("Layout_Spring_Weight", 1.0)))
+    for (ru, rv), weights in rep_edge_weights.items():
+        # Averaging preserves the unweighted layout when all underlying weights are 1.
+        Grep.add_edge(ru, rv, Layout_Spring_Weight=float(sum(weights) / len(weights)))
     return rep_of, reps, Grep
 # ---------------------------
 # Representative layout (scale-aware)
 # ---------------------------
-def compute_layout_scale(G, min_sep=80.0, layout_scale=None, layout_scale_factor=8.0):
+def compute_layout_scale(G, min_sep=80.0, layout_scale=None, layout_scale_factor=0.75):
     if layout_scale is not None and float(layout_scale) > 0.0:
         return float(layout_scale)
     n = max(1, G.number_of_nodes())
-    return max(3.0 * float(min_sep), float(layout_scale_factor) * math.sqrt(float(n)))
+    # A feasible 2D canvas must grow with both node count and required spacing.
+    return max(3.0 * float(min_sep), float(layout_scale_factor) * float(min_sep) * math.sqrt(float(n)))
 
 def layout_reps_scale_aware(Grep, layout_scale=900.0, sweeps=4, seed=42):
     nodes = list(Grep.nodes())
@@ -265,7 +458,16 @@ def layout_reps_scale_aware(Grep, layout_scale=900.0, sweeps=4, seed=42):
         return {n: (radius * math.cos(2 * math.pi * i / max(1, k)), radius * math.sin(2 * math.pi * i / max(1, k))) for i, n in enumerate(nodes)}
 
     k_val = max(1e-6, float(layout_scale) / max(1.0, math.sqrt(max(1, len(nodes)))))
-    pos = nx.spring_layout(Grep, seed=seed, k=k_val, iterations=max(25, 25 * max(1, sweeps)), scale=float(layout_scale), center=(0.0, 0.0), dim=2)
+    pos = nx.spring_layout(
+        Grep,
+        seed=seed,
+        k=k_val,
+        iterations=max(25, 25 * max(1, sweeps)),
+        scale=float(layout_scale),
+        center=(0.0, 0.0),
+        dim=2,
+        weight="Layout_Spring_Weight",
+    )
     return {n: (float(x), float(y)) for n, (x, y) in pos.items()}
 # ---------------------------
 # Mirror enforcement and initial positions
@@ -482,6 +684,36 @@ def equalize_hemi_span(pos: Dict[str, Tuple[float, float]],
             newpos[n] = (x, float(y_new))
 
     return newpos
+
+
+def axis_chiral_span_metrics(pos: Dict[str, Tuple[float, float]], sides: Dict[str, str]) -> Dict[str, float]:
+    axis_y = [float(pos[n][1]) for n, side in sides.items() if side == "axis" and n in pos]
+    chiral_y = [float(pos[n][1]) for n, side in sides.items() if side != "axis" and n in pos]
+    axis_span = max(axis_y) - min(axis_y) if len(axis_y) > 1 else 0.0
+    chiral_span = max(chiral_y) - min(chiral_y) if len(chiral_y) > 1 else 0.0
+    return {
+        "axis_y_span": float(axis_span),
+        "chiral_y_span": float(chiral_span),
+        "axis_to_chiral_span_ratio": float(axis_span / chiral_span) if chiral_span > 1e-12 else float("inf"),
+    }
+
+
+def expand_chiral_span_to_axis(pos: Dict[str, Tuple[float, float]], sides: Dict[str, str], target_ratio: float = 1.0):
+    """Expand, but never compress, the chiral y-span to match the axis target."""
+    metrics = axis_chiral_span_metrics(pos, sides)
+    target_chiral_span = metrics["axis_y_span"] / max(float(target_ratio), 1e-12)
+    if metrics["chiral_y_span"] <= 1e-12 or metrics["chiral_y_span"] >= target_chiral_span:
+        return dict(pos), metrics
+    scale = target_chiral_span / metrics["chiral_y_span"]
+    chiral_y = [float(pos[n][1]) for n, side in sides.items() if side != "axis" and n in pos]
+    centre = float(np.median(chiral_y))
+    expanded = dict(pos)
+    for node, side in sides.items():
+        if side == "axis" or node not in expanded:
+            continue
+        x, y = expanded[node]
+        expanded[node] = (x, centre + (float(y) - centre) * scale)
+    return expanded, axis_chiral_span_metrics(expanded, sides)
 
 # ---------------------------
 # Achiral axis arrangement & adjacency
@@ -792,7 +1024,7 @@ def _point_segment_distance(p, a, b):
     proj = (ax + t * dx, ay + t * dy)
     return math.hypot(px - proj[0], py - proj[1])
 
-def adjust_positions_with_constraints(G, pos, pairs, sides, min_sep=40.0, edge_clearance=12.0, max_iter=200, lr=0.25, fixed_achiral_y=None, axis_lateral_gap=None):
+def adjust_positions_with_constraints(G, pos, pairs, sides, min_sep=40.0, edge_clearance=12.0, max_iter=200, lr=0.25, fixed_achiral_y=None, axis_lateral_gap=None, strict_min_sep_rounds=0):
     nodes = list(G.nodes())
     pcoords = {n: [float(pos.get(n, (0.0, 0.0))[0]), float(pos.get(n, (0.0, 0.0))[1])] for n in nodes}
     axis_set = {n for n in nodes if sides.get(n, '') == 'axis'}
@@ -937,7 +1169,8 @@ def adjust_positions_with_constraints(G, pos, pairs, sides, min_sep=40.0, edge_c
             if not any_moved:
                 break
 
-    enforce_strict_min_sep(pcoords, min_sep, axis_set, pairs, sides)
+    if strict_min_sep_rounds:
+        enforce_strict_min_sep(pcoords, min_sep, axis_set, pairs, sides, max_rounds=strict_min_sep_rounds)
     newpos = {n: (float(pcoords[n][0]), float(pcoords[n][1])) for n in nodes}
     return newpos
 
@@ -1004,6 +1237,26 @@ def positions_exactly_equal(pos_a: Dict[str, Tuple[float, float]], pos_b: Dict[s
         if pos_a[n] != pos_b[n]:
             return False
     return True
+
+
+def transactional_cycle_is_better(start_valid, start_score, end_valid, end_score, tolerance=1e-12):
+    """Decide whether to retain a cycle once full separation is established."""
+    if not start_valid:
+        return True
+    return bool(end_valid) and float(end_score) < float(start_score) - float(tolerance)
+
+
+def spearman_rank_correlation(pairs):
+    """Compute Spearman correlation with average tie ranks and no SciPy dependency."""
+    if len(pairs) < 2:
+        return None
+    x = pd.Series([float(pair[0]) for pair in pairs], dtype="float64").rank(method="average").to_numpy()
+    y = pd.Series([float(pair[1]) for pair in pairs], dtype="float64").rank(method="average").to_numpy()
+    if not np.isfinite(x).all() or not np.isfinite(y).all():
+        return None
+    if float(np.std(x)) <= 1e-15 or float(np.std(y)) <= 1e-15:
+        return None
+    return float(np.corrcoef(x, y)[0, 1])
 
 def edge_cross_count_against_list(edge, edge_list, pos, edge_bboxes):
     a1 = pos[edge[0]]; a2 = pos[edge[1]]
@@ -1148,21 +1401,35 @@ def estimate_delta_crossings_for_move_sampled(G, pos, moved_nodes: Set[str], can
     sample_size = max(1, min(int(sample_size), old_total))
     rng = random.Random(seed)
 
-    newpos = dict(pos)
-    newpos.update(candidate_pos)
-
     old_hits = 0
     new_hits = 0
     trials = 0
+    n_changed = len(E_changed)
+    n_other = len(E_other)
+    changed_changed_total = n_changed * (n_changed - 1) // 2
+    changed_other_total = n_changed * n_other
+    sampling_total = changed_changed_total + changed_other_total
+
+    def point(node):
+        return candidate_pos.get(node, pos[node])
+
     while trials < sample_size:
-        pair = _sample_crossing_pair(edges_all, rng, changed_edges=E_changed)
-        if pair is None:
+        if sampling_total <= 0:
             break
-        e1, e2 = pair
+        draw = rng.randrange(sampling_total)
+        if draw < changed_changed_total:
+            i = rng.randrange(n_changed)
+            j = rng.randrange(n_changed - 1)
+            if j >= i:
+                j += 1
+            e1, e2 = E_changed[i], E_changed[j]
+        else:
+            e1 = E_changed[rng.randrange(n_changed)]
+            e2 = E_other[rng.randrange(n_other)]
         if set(e1) & set(e2):
             continue
         old_cross = _segments_intersect(pos[e1[0]], pos[e1[1]], pos[e2[0]], pos[e2[1]])
-        new_cross = _segments_intersect(newpos[e1[0]], newpos[e1[1]], newpos[e2[0]], newpos[e2[1]])
+        new_cross = _segments_intersect(point(e1[0]), point(e1[1]), point(e2[0]), point(e2[1]))
         old_hits += 1 if old_cross else 0
         new_hits += 1 if new_cross else 0
         trials += 1
@@ -1751,22 +2018,41 @@ def optimize_chiral_coordinate_relaxation(
         cy = 0.5 * (pmap[A][1] + pmap[B][1])
         return mag, cy
 
-    def neighbour_targets(pid, pmap):
-        neigh = set()
-        for n in pairs[pid]:
-            for nbr in G[n]:
-                q = pair_of.get(nbr)
-                if q is not None and q != pid:
-                    neigh.add(q)
-        if not neigh:
-            return None
-        mags = []
-        ys = []
-        for q in neigh:
-            A, B = pairs[q]
-            mags.append(0.5 * (abs(pmap[A][0]) + abs(pmap[B][0])))
-            ys.append(0.5 * (pmap[A][1] + pmap[B][1]))
-        return float(np.median(mags)), float(np.median(ys))
+    def proposal_direction(pid, pmap, grid, inv_cell):
+        """Return a mirror-coordinate direction from weighted pull and soft repulsion."""
+        force_x, force_y = 0.0, 0.0
+        soft_sep = float(min_sep) * float(LAYOUT_SOFT_SEP_FACTOR)
+        own_nodes = set(pairs[pid])
+        for node in own_nodes:
+            x, y = pmap[node]
+            sign = 1.0 if x >= 0.0 else -1.0
+            for nbr, edge_data in G[node].items():
+                if nbr in own_nodes:
+                    continue
+                if not edge_in_length_objective(G, node, nbr):
+                    continue
+                nx_, ny_ = pmap[nbr]
+                weight = float(edge_data.get("Layout_Spring_Weight", 1.0))
+                force_x += sign * weight * (nx_ - x)
+                force_y += weight * (ny_ - y)
+            ix, iy = int(math.floor(x * inv_cell)), int(math.floor(y * inv_cell))
+            for dx_cell in (-1, 0, 1):
+                for dy_cell in (-1, 0, 1):
+                    for other in grid.get((ix + dx_cell, iy + dy_cell), []):
+                        if other in own_nodes:
+                            continue
+                        ox, oy = pmap[other]
+                        dx, dy = x - ox, y - oy
+                        distance = math.hypot(dx, dy)
+                        if distance >= soft_sep:
+                            continue
+                        if distance < 1e-12:
+                            dx, dy, distance = 1.0, 0.0, 1.0
+                        repulsion = (soft_sep - distance) / soft_sep
+                        force_x += sign * repulsion * (dx / distance) * float(min_sep)
+                        force_y += repulsion * (dy / distance) * float(min_sep)
+        magnitude = math.hypot(force_x, force_y)
+        return None if magnitude < 1e-12 else (force_x / magnitude, force_y / magnitude)
 
     current_pos = dict(pos)
     edge_target_length = _median_edge_length_from_pos(current_pos, edges_all)
@@ -1798,15 +2084,13 @@ def optimize_chiral_coordinate_relaxation(
         spatial_grid, inv_cell = _build_spatial_hash(best_pos, repulse_dist)
         for _ in range(tries_per_iter):
             pid = rng.choice(chiral_pair_ids)
-            target = neighbour_targets(pid, best_pos)
-            if target is None:
+            direction = proposal_direction(pid, best_pos, spatial_grid, inv_cell)
+            if direction is None:
                 continue
-
-            target_mag, target_y = target
             cur_mag, cur_y = pair_center(pid, best_pos)
-
-            new_mag = max(min_x, cur_mag + x_rate * (target_mag - cur_mag))
-            new_y = cur_y + y_rate * (target_y - cur_y)
+            step = 0.5 * float(min_sep)
+            new_mag = max(min_x, cur_mag + x_rate * step * direction[0])
+            new_y = cur_y + y_rate * step * direction[1]
 
             right, left = pair_right_left(pid, best_pos)
             candidate_pos = {
@@ -2034,6 +2318,279 @@ def enforce_strict_mirror(pos, pairs, sides, tol=1e-8):
                 changed = True
     return pos2, changed
 
+
+def separation_diagnostics(pos, min_sep):
+    """Return spatially indexed hard-separation diagnostics.
+
+    ``total_squared_deficit`` is continuous and is used to decide whether a
+    coordinate-changing operation has made an infeasible layout worse.  The
+    count and minimum distance remain useful human-readable diagnostics.
+    """
+    target = float(min_sep)
+    if target <= 0.0 or len(pos) < 2:
+        return {
+            "threshold": target,
+            "remaining_violations": 0,
+            "minimum_distance": float("inf"),
+            "maximum_fractional_deficit": 0.0,
+            "total_squared_deficit": 0.0,
+        }
+    grid, inv_cell = _build_spatial_hash(pos, target)
+    seen = set()
+    remaining = 0
+    min_distance = float("inf")
+    max_deficit = 0.0
+    total_deficit = 0.0
+    for node, (x, y) in pos.items():
+        x, y = float(x), float(y)
+        ix, iy = int(math.floor(x * inv_cell)), int(math.floor(y * inv_cell))
+        for dx_cell in (-1, 0, 1):
+            for dy_cell in (-1, 0, 1):
+                for other in grid.get((ix + dx_cell, iy + dy_cell), []):
+                    if other == node:
+                        continue
+                    key = (node, other) if node <= other else (other, node)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    ox, oy = pos[other]
+                    distance = math.hypot(x - float(ox), y - float(oy))
+                    min_distance = min(min_distance, distance)
+                    if distance >= target:
+                        continue
+                    remaining += 1
+                    deficit = (target - distance) / target
+                    max_deficit = max(max_deficit, deficit)
+                    total_deficit += deficit * deficit
+    return {
+        "threshold": target,
+        "remaining_violations": remaining,
+        "minimum_distance": min_distance,
+        "maximum_fractional_deficit": max_deficit,
+        "total_squared_deficit": total_deficit,
+    }
+
+
+def separation_not_worse(before, after, tolerance=1e-10):
+    """Accept equal/improved infeasibility, and preserve feasibility once reached."""
+    if before["remaining_violations"] == 0:
+        return after["remaining_violations"] == 0
+    scale = max(1.0, float(before["total_squared_deficit"]))
+    return float(after["total_squared_deficit"]) <= float(before["total_squared_deficit"]) + tolerance * scale
+
+
+def enforce_minimum_separation_mirror_preserving(
+    pos, pairs, sides, min_sep=60.0, max_iter=200, damping=0.65, stall_limit=12
+):
+    """Project close nodes apart with damped sequential mirror-safe updates.
+
+    A spatial hash finds only nearby pairs.  Corrections are applied
+    sequentially (Gauss-Seidel style), so later collisions see earlier moves
+    rather than all nodes responding to stale coordinates.  A pass is retained
+    only when the continuous separation deficit decreases.
+    """
+    target = float(min_sep)
+    # A tiny overshoot avoids floating-point/stall-limit residues just below
+    # the requested hard distance without visibly changing the layout scale.
+    projection_target = target + max(1e-8, abs(target) * 1e-4)
+    work, _ = enforce_strict_mirror(pos, pairs, sides)
+    initial_diag = separation_diagnostics(work, target)
+    if target <= 0.0 or len(work) < 2 or max_iter <= 0 or initial_diag["remaining_violations"] == 0:
+        return work, {"iterations": 0, "converged": initial_diag["remaining_violations"] == 0, **initial_diag}
+
+    # When a substantial fraction of the graph is crowded, a small uniform
+    # expansion reduces collective jamming before local corrections.  The cap
+    # limits any one projection event to three percent; crossings and mirror
+    # symmetry are unchanged by this transformation.
+    pre_scale = 1.0
+    crowded_cutoff = max(100, int(0.10 * len(work)))
+    if initial_diag["remaining_violations"] >= crowded_cutoff and initial_diag["minimum_distance"] > 0.0:
+        desired_scale = math.sqrt(projection_target / float(initial_diag["minimum_distance"]))
+        pre_scale = min(1.03, max(1.0, desired_scale))
+        if pre_scale > 1.000001:
+            center_y = float(np.median([float(point[1]) for point in work.values()]))
+            work = {
+                node: (
+                    float(point[0]) * pre_scale,
+                    center_y + (float(point[1]) - center_y) * pre_scale,
+                )
+                for node, point in work.items()
+            }
+            work, _ = enforce_strict_mirror(work, pairs, sides)
+            initial_diag = separation_diagnostics(work, target)
+
+    partner = {}
+    for a, b in pairs.values():
+        partner[a] = b
+        partner[b] = a
+
+    def entity(node):
+        if sides.get(node) == "axis" or node not in partner:
+            return ("axis", node)
+        return ("pair", min(node, partner[node]))
+
+    def stable_direction(a, b, iteration):
+        value = sum((index + 1) * ord(ch) for index, ch in enumerate(f"{a}|{b}|{iteration}")) % 360
+        angle = math.radians(float(value))
+        return math.cos(angle), math.sin(angle)
+
+    def move_entity_through_node(node, dx, dy, step_cap):
+        length = math.hypot(dx, dy)
+        if length > step_cap:
+            scale = step_cap / length
+            dx, dy = dx * scale, dy * scale
+        key = entity(node)
+        if key[0] == "axis":
+            work[node] = (0.0, float(work[node][1]) + dy)
+            return
+        other = partner[node]
+        right, left = (node, other) if work[node][0] >= 0.0 else (other, node)
+        physical_sign = 1.0 if work[node][0] >= 0.0 else -1.0
+        magnitude = max(0.5 * projection_target, abs(float(work[right][0])) + physical_sign * dx)
+        common_y = 0.5 * (float(work[right][1]) + float(work[left][1])) + dy
+        work[right] = (magnitude, common_y)
+        work[left] = (-magnitude, common_y)
+
+    best_work = dict(work)
+    best_diag = initial_diag
+    current_damping = min(1.0, max(0.05, float(damping)))
+    stalled = 0
+    iterations_used = 0
+    for iteration in range(1, int(max_iter) + 1):
+        iterations_used = iteration
+        grid, inv_cell = _build_spatial_hash(work, target)
+        seen = set()
+        violations = []
+        for node, (x, y) in work.items():
+            x, y = float(x), float(y)
+            ix, iy = int(math.floor(x * inv_cell)), int(math.floor(y * inv_cell))
+            for dx_cell in (-1, 0, 1):
+                for dy_cell in (-1, 0, 1):
+                    for other in grid.get((ix + dx_cell, iy + dy_cell), []):
+                        if other == node:
+                            continue
+                        key = (node, other) if node <= other else (other, node)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        ox, oy = work[other]
+                        distance = math.hypot(x - float(ox), y - float(oy))
+                        if distance < target:
+                            violations.append((distance, node, other))
+        if not violations:
+            final_diag = separation_diagnostics(work, target)
+            return work, {"iterations": iteration - 1, "converged": True, "pre_scale": pre_scale, **final_diag}
+
+        # Resolve the deepest overlaps first; reverse ties on alternate passes
+        # so a stable identifier ordering cannot trap the same crowded region.
+        violations.sort(key=lambda item: (item[0], item[1], item[2]), reverse=(iteration % 2 == 0))
+        snapshot = dict(work)
+        step_cap = max(1e-9, 0.25 * target)
+        for _, node, other in violations:
+            x, y = work[node]
+            ox, oy = work[other]
+            dx, dy = float(x) - float(ox), float(y) - float(oy)
+            distance = math.hypot(dx, dy)
+            if distance >= target:
+                continue
+            if entity(node) == entity(other):
+                if entity(node)[0] == "pair":
+                    a, b = node, other
+                    right, left = (a, b) if work[a][0] >= 0.0 else (b, a)
+                    common_y = 0.5 * (float(work[right][1]) + float(work[left][1]))
+                    work[right] = (max(abs(float(work[right][0])), 0.5 * projection_target), common_y)
+                    work[left] = (-max(abs(float(work[right][0])), 0.5 * projection_target), common_y)
+                continue
+            if distance < 1e-12:
+                ux, uy = stable_direction(node, other, iteration)
+            else:
+                ux, uy = dx / distance, dy / distance
+            correction = current_damping * (projection_target - distance)
+            move_entity_through_node(node, 0.5 * correction * ux, 0.5 * correction * uy, step_cap)
+            move_entity_through_node(other, -0.5 * correction * ux, -0.5 * correction * uy, step_cap)
+
+        work, _ = enforce_strict_mirror(work, pairs, sides)
+        candidate_diag = separation_diagnostics(work, target)
+        if candidate_diag["remaining_violations"] == 0:
+            return work, {"iterations": iteration, "converged": True, "pre_scale": pre_scale, **candidate_diag}
+        previous = float(best_diag["total_squared_deficit"])
+        candidate = float(candidate_diag["total_squared_deficit"])
+        if candidate + 1e-12 < previous:
+            best_work = dict(work)
+            best_diag = candidate_diag
+            relative_gain = (previous - candidate) / max(previous, 1e-12)
+            stalled = stalled + 1 if relative_gain < 1e-5 else 0
+            current_damping = min(0.85, current_damping * 1.02)
+        else:
+            work = dict(best_work)
+            current_damping = max(0.05, current_damping * 0.5)
+            stalled += 1
+        if stalled >= int(stall_limit):
+            break
+
+    # Dense layouts can approach the boundary asymptotically.  Once every
+    # residual is within one percent of the threshold, a sub-percent uniform
+    # expansion about the median y coordinate guarantees feasibility while
+    # preserving mirror symmetry and the complete crossing topology.
+    min_distance = float(best_diag["minimum_distance"])
+    if math.isfinite(min_distance) and min_distance > 0.0:
+        fallback_scale = projection_target / min_distance
+        if fallback_scale <= 1.01:
+            center_y = float(np.median([float(point[1]) for point in best_work.values()]))
+            expanded = {
+                node: (
+                    float(point[0]) * fallback_scale,
+                    center_y + (float(point[1]) - center_y) * fallback_scale,
+                )
+                for node, point in best_work.items()
+            }
+            expanded, _ = enforce_strict_mirror(expanded, pairs, sides)
+            expanded_diag = separation_diagnostics(expanded, target)
+            if expanded_diag["remaining_violations"] == 0:
+                return expanded, {
+                    "iterations": iterations_used,
+                    "converged": True,
+                    "pre_scale": pre_scale,
+                    "fallback_scale": fallback_scale,
+                    **expanded_diag,
+                }
+    return best_work, {"iterations": iterations_used, "converged": False, "pre_scale": pre_scale, **best_diag}
+
+
+def project_candidate_for_separation(
+    base_pos,
+    candidate_pos,
+    pairs,
+    sides,
+    active_separation,
+    max_iter=100,
+    stall_limit=12,
+):
+    """Repair a candidate before objective scoring when it worsens separation.
+
+    Optimisation stages are allowed to pass temporarily through an infeasible
+    layout.  If a complete stage worsens the active separation constraint, its
+    result is projected back toward feasibility while preserving mirror
+    symmetry.  The caller must score the returned coordinates, not the raw
+    candidate, so a move is retained only when its repaired form improves the
+    full objective.
+    """
+    target = float(active_separation)
+    before = separation_diagnostics(base_pos, target)
+    candidate_diag = separation_diagnostics(candidate_pos, target)
+    if target <= 0.0 or separation_not_worse(before, candidate_diag):
+        return dict(candidate_pos), candidate_diag, False, True
+
+    projected, projected_diag = enforce_minimum_separation_mirror_preserving(
+        candidate_pos,
+        pairs,
+        sides,
+        min_sep=target,
+        max_iter=max_iter,
+        stall_limit=stall_limit,
+    )
+    return projected, projected_diag, True, separation_not_worse(before, projected_diag)
+
 def write_gexf_with_viz(G, pos, out_path):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
@@ -2044,9 +2601,15 @@ def write_gexf_with_viz(G, pos, out_path):
         f.write('      <attribute id="1" title="DeltaE" type="float"/>\n')
         f.write('      <attribute id="2" title="Chirality" type="string"/>\n')
         f.write('      <attribute id="3" title="Enantiomer_Id" type="string"/>\n')
+        f.write('      <attribute id="4" title="Relative_Energy" type="float"/>\n')
         f.write('    </attributes>\n')
         f.write('    <attributes class="edge">\n')
         f.write('      <attribute id="10" title="TS_Energy" type="float"/>\n')
+        f.write('      <attribute id="11" title="Relative_TS_Energy" type="float"/>\n')
+        f.write('      <attribute id="12" title="Activation_Barrier" type="float"/>\n')
+        f.write('      <attribute id="13" title="Energy_Data_Status" type="string"/>\n')
+        f.write('      <attribute id="14" title="Layout_Spring_Weight" type="float"/>\n')
+        f.write('      <attribute id="15" title="Input_Edge_Rows" type="integer"/>\n')
         f.write('    </attributes>\n')
         f.write('    <nodes>\n')
         for n, data in G.nodes(data=True):
@@ -2057,6 +2620,8 @@ def write_gexf_with_viz(G, pos, out_path):
             f.write(f'          <attvalue for="1" value="{float(data.get("DeltaE", 0.0))}"/>\n')
             f.write(f'          <attvalue for="2" value="{data.get("Chirality", "")}"/>\n')
             f.write(f'          <attvalue for="3" value="{data.get("Enantiomer_Id", "")}"/>\n')
+            if "Relative_Energy" in data:
+                f.write(f'          <attvalue for="4" value="{float(data["Relative_Energy"])}"/>\n')
             f.write('        </attvalues>\n')
             f.write(f'        <viz:position x="{x}" y="{y}" z="0"/>\n')
             f.write('      </node>\n')
@@ -2065,7 +2630,17 @@ def write_gexf_with_viz(G, pos, out_path):
         i = 0
         for u, v, data in G.edges(data=True):
             f.write(f'      <edge id="{i}" source="{u}" target="{v}">\n')
-            f.write(f'        <attvalues><attvalue for="10" value="{float(data.get("TS_Energy", 0.0))}"/></attvalues>\n')
+            f.write('        <attvalues>\n')
+            if "TS_Energy" in data:
+                f.write(f'          <attvalue for="10" value="{float(data["TS_Energy"])}"/>\n')
+            if "Relative_TS_Energy" in data:
+                f.write(f'          <attvalue for="11" value="{float(data["Relative_TS_Energy"])}"/>\n')
+            if "Activation_Barrier" in data:
+                f.write(f'          <attvalue for="12" value="{float(data["Activation_Barrier"])}"/>\n')
+            f.write(f'          <attvalue for="13" value="{data.get("Energy_Data_Status", "unweighted")}"/>\n')
+            f.write(f'          <attvalue for="14" value="{float(data.get("Layout_Spring_Weight", 1.0))}"/>\n')
+            f.write(f'          <attvalue for="15" value="{int(data.get("Input_Edge_Rows", 1))}"/>\n')
+            f.write('        </attvalues>\n')
             f.write('      </edge>\n')
             i += 1
         f.write('    </edges>\n')
@@ -2101,6 +2676,73 @@ def load_positions_from_gexf(gexf_path, nodes=None):
             pos.setdefault(n, (0.0, 0.0))
     return pos
 
+
+def replace_atomic_with_retries(temporary, destination, retry_attempts=8, retry_delay=0.25):
+    """Replace atomically, retrying locks and preserving a recovery file if needed."""
+    temporary = Path(temporary)
+    destination = Path(destination)
+    attempts = max(1, int(retry_attempts))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            temporary.replace(destination)
+            return destination
+        except PermissionError as exc:
+            last_error = exc
+            if attempt < attempts:
+                if attempt == 1:
+                    print(
+                        f"[CHECKPOINT] destination is locked; retrying atomic replace -> {destination}",
+                        flush=True,
+                    )
+                time.sleep(max(0.0, float(retry_delay)) * attempt)
+
+    timestamp = time.strftime("%Y%m%dT%H%M%S")
+    recovery = destination.with_name(
+        f"{destination.stem}.recovery-{timestamp}-{time.time_ns() % 1_000_000_000:09d}{destination.suffix}"
+    )
+    temporary.replace(recovery)
+    print(
+        f"[CHECKPOINT] WARNING: could not replace locked destination after {attempts} attempts; "
+        f"preserved newest data at {recovery}. Last error: {last_error}",
+        flush=True,
+    )
+    return recovery
+
+
+def write_gexf_atomic(G, pos, out_path):
+    """Write a GEXF checkpoint atomically and return the path actually written."""
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    write_gexf_with_viz(G, pos, temporary)
+    return replace_atomic_with_retries(temporary, path)
+
+
+def write_json_atomic(payload, out_path):
+    path = Path(out_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return replace_atomic_with_retries(temporary, path)
+
+
+def parse_separation_levels(text, min_sep):
+    """Parse increasing fractions or absolute distances ending at min_sep."""
+    if text is None or not str(text).strip():
+        values = [0.33, 0.50, 0.67, 0.83, 0.90, 0.95, 1.00]
+    else:
+        try:
+            values = [float(part.strip()) for part in str(text).split(",") if part.strip()]
+        except ValueError as exc:
+            raise ValueError("--separation-levels must be a comma-separated list of positive numbers.") from exc
+    if not values or any(value <= 0.0 for value in values):
+        raise ValueError("--separation-levels must contain positive numbers.")
+    target = float(min_sep)
+    distances = [value * target if value <= 1.0 else value for value in values]
+    distances.append(target)
+    return sorted(set(min(target, max(1e-9, float(value))) for value in distances))
+
 # ---------------------------
 # Main orchestration
 # ---------------------------
@@ -2133,6 +2775,8 @@ def write_xgmml_with_viz(G, pos, out_path, graph_label="BVGraph"):
             f.write(attr_xml("Chirality", data.get("Chirality", ""), "string"))
             f.write(attr_xml("Enantiomer_Id", data.get("Enantiomer_Id", ""), "string"))
             f.write(attr_xml("Barcode_Normalized", data.get("Barcode_Normalized", ""), "string"))
+            if "Relative_Energy" in data:
+                f.write(attr_xml("Relative_Energy", float(data["Relative_Energy"]), "real"))
             # add graphics element with coordinates
             f.write(f'    <graphics x="{float(x)}" y="{float(y)}"/>\\n')
             f.write('  </node>\\n')
@@ -2142,7 +2786,15 @@ def write_xgmml_with_viz(G, pos, out_path, graph_label="BVGraph"):
             uid = saxutils.escape(str(u))
             vid = saxutils.escape(str(v))
             f.write(f'  <edge id="e{edge_id}" label="e{edge_id}" source="{uid}" target="{vid}">\\n')
-            f.write(attr_xml("TS_Energy", float(data.get("TS_Energy", 0.0)), "real"))
+            if "TS_Energy" in data:
+                f.write(attr_xml("TS_Energy", float(data["TS_Energy"]), "real"))
+            if "Relative_TS_Energy" in data:
+                f.write(attr_xml("Relative_TS_Energy", float(data["Relative_TS_Energy"]), "real"))
+            if "Activation_Barrier" in data:
+                f.write(attr_xml("Activation_Barrier", float(data["Activation_Barrier"]), "real"))
+            f.write(attr_xml("Energy_Data_Status", data.get("Energy_Data_Status", "unweighted"), "string"))
+            f.write(attr_xml("Layout_Spring_Weight", float(data.get("Layout_Spring_Weight", 1.0)), "real"))
+            f.write(attr_xml("Input_Edge_Rows", int(data.get("Input_Edge_Rows", 1)), "integer"))
             f.write('  </edge>\\n')
             edge_id += 1
         f.write('</graph>\\n')
@@ -2163,6 +2815,8 @@ def write_nodes_coords_csv(G, pos, out_path, id_col="id"):
             "Chirality": data.get("Chirality", ""),
             "Energy": float(data.get("Energy", 0.0)),
             "DeltaE": float(data.get("DeltaE", 0.0)),
+            "Relative Energy (kJ/mol)": data.get("Relative_Energy", ""),
+            "Energy Data Status": data.get("Energy_Data_Status", ""),
             "Enantiomer_Id": data.get("Enantiomer_Id", "")
         })
     df = _pd.DataFrame(rows)
@@ -2170,12 +2824,21 @@ def write_nodes_coords_csv(G, pos, out_path, id_col="id"):
 
 def write_edges_csv(G, out_path):
     """
-    Writes a CSV with columns: Source, Target, TS_Energy
+    Writes a CSV with layout-energy metadata for each simple undirected edge.
     """
     import pandas as _pd
     rows = []
     for u, v, data in G.edges(data=True):
-        rows.append({"Source": u, "Target": v, "TS_Energy": float(data.get("TS_Energy", 0.0))})
+        rows.append({
+            "Source": u,
+            "Target": v,
+            "TS_Energy": data.get("TS_Energy", ""),
+            "Relative TS Energy (kJ/mol)": data.get("Relative_TS_Energy", ""),
+            "Activation Barrier (kJ/mol)": data.get("Activation_Barrier", ""),
+            "Energy Data Status": data.get("Energy_Data_Status", "unweighted"),
+            "Layout Spring Weight": float(data.get("Layout_Spring_Weight", 1.0)),
+            "Input Edge Rows": int(data.get("Input_Edge_Rows", 1)),
+        })
     df = _pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
 
@@ -2191,7 +2854,50 @@ def main():
     ap.add_argument("--snap-achiral", type=int, default=1)
     ap.add_argument("--min-sep", type=float, default=60.0)
     ap.add_argument("--edge-clearance", type=float, default=12.0)
-    ap.add_argument("--overlap-iter", type=int, default=200)
+    ap.add_argument("--overlap-iter", type=int, default=0,
+                    help="Legacy all-pairs node/edge clearance iterations; leave at 0 for scalable layouts.")
+    ap.add_argument("--final-separation-iters", type=int, default=200,
+                    help="Mirror-preserving spatial-grid iterations used to enforce --min-sep after final mirroring.")
+    ap.add_argument(
+        "--separation-mode", choices=["legacy_final", "progressive"], default="legacy_final",
+        help="Use legacy final-only enforcement or progressive mirror-preserving separation during refinement.",
+    )
+    ap.add_argument(
+        "--separation-levels", default="0.33,0.50,0.67,0.83,0.90,0.95,1.00",
+        help="Comma-separated fractions of --min-sep (values <=1) or absolute distances for progressive enforcement.",
+    )
+    ap.add_argument("--separation-project-every", type=int, default=5,
+                    help="Run a progressive global projection every N completed cycles while the active level has violations.")
+    ap.add_argument("--separation-project-iters", type=int, default=100,
+                    help="Maximum damped spatial projection passes at each progressive repair event.")
+    ap.add_argument("--separation-stall-passes", type=int, default=12,
+                    help="Stop a projection after this many passes without material separation-deficit improvement.")
+    ap.add_argument("--layout-scale-factor", type=float, default=0.75,
+                    help="Initial layout radius factor multiplied by --min-sep and sqrt(node count).")
+    ap.add_argument("--objective-mode", choices=["legacy", "initial_normalized"], default="legacy",
+                    help="Use original raw score coefficients or normalize crossings and weighted edge length to the starting layout.")
+    ap.add_argument("--objective-reference-crossings", type=float, default=None,
+                    help="Optional fixed crossing reference for initial_normalized mode (use when continuing a prior run).")
+    ap.add_argument("--objective-reference-weighted-length", type=float, default=None,
+                    help="Optional fixed weighted-edge-length reference for initial_normalized mode (use when continuing a prior run).")
+    ap.add_argument("--objective-reference-spacing-penalty", type=float, default=None,
+                    help="Optional fixed soft-spacing reference for initial_normalized mode (use when continuing a prior run).")
+    ap.add_argument("--objective-crossing-weight", type=float, default=0.20,
+                    help="Crossing importance; in initial_normalized mode this is the requested normalized coefficient.")
+    ap.add_argument("--objective-edge-length-weight", type=float, default=1.00,
+                    help="Energy-weighted edge-length importance; normalized to the starting value when requested.")
+    ap.add_argument(
+        "--edge-objective-scope",
+        choices=["all", "finite_energy"],
+        default="all",
+        help="Edges included in edge-length objective terms; finite_energy excludes records without a calculated activation barrier.",
+    )
+    ap.add_argument("--objective-spacing-weight", type=float, default=8.00,
+                    help="Soft spacing importance; normalized to the starting penalty in initial_normalized mode. Hard minimum separation remains non-negotiable.")
+    ap.add_argument("--soft-separation-factor", type=float, default=1.35,
+                    help="Soft preferred separation as a multiple of --min-sep (must be at least 1).")
+    ap.add_argument("--out-metrics-json", default=None,
+                    help="Optional JSON file recording objective references and final layout metrics.")
     ap.add_argument("--achiral-gap", type=float, default=None, help="If not set, will be set equal to --min-sep.")
     ap.add_argument("--swap-iters", type=int, default=1000)
     ap.add_argument("--axis-min-gap", type=float, default=None)
@@ -2200,6 +2906,8 @@ def main():
     ap.add_argument("--axis-lateral-gap", type=float, default=None)
     ap.add_argument("--chiral-swap-iters", type=int, default=500)
     ap.add_argument("--pairpair-iters", type=int, default=100)
+    ap.add_argument("--pair-flip-iters", type=int, default=50,
+                    help="Maximum pair-flip attempts per refinement cycle.")
     ap.add_argument("--chiral-relax", action="store_true",
                     help="Relax chiral pair coordinates while preserving mirror symmetry.")
     ap.add_argument("--chiral-relax-iters", type=int, default=150)
@@ -2215,6 +2923,20 @@ def main():
     ap.add_argument("--chiral-relax-min-x", type=float, default=5.0)
     ap.add_argument("--cycle-shift-tol", type=float, default=0.25,
                     help="Stop refinement early when the maximum node displacement over a cycle falls below this tolerance.")
+    ap.add_argument("--convergence-patience", type=int, default=1,
+                    help="Require this many consecutive stalled cycles before stopping early (default 1).")
+    ap.add_argument(
+        "--transactional-valid-cycles",
+        action="store_true",
+        help="Once full minimum separation is reached, retain a cycle only if its repaired final layout remains valid and improves the cycle-start objective.",
+    )
+    ap.add_argument(
+        "--stage-diagnostics",
+        action="store_true",
+        help="Log retained-coordinate movement, objective and separation diagnostics after every move class.",
+    )
+    ap.add_argument("--run-all-refine-cycles", action="store_true",
+                    help="Run every requested refinement cycle even if a cycle has no accepted move or falls below --cycle-shift-tol.")
     ap.add_argument("--axis-node-relax", action="store_true",
                     help="Nudge selected axis nodes away from nearby edges before final export.")
     ap.add_argument("--axis-node-relax-id", default=None,
@@ -2254,13 +2976,74 @@ def main():
     ap.add_argument("--checkpoint-gephi", default=None, help="Optional temporary GEXF checkpoint file to overwrite during refinement.")
     ap.add_argument("--checkpoint-every", type=int, default=5, help="Write checkpoint every N completed refinement cycles.")
     ap.add_argument("--resume-gephi", default=None, help="Resume starting coordinates from a temporary GEXF checkpoint file.")
+    ap.add_argument("--checkpoint-state-json", default=None,
+                    help="Atomic JSON sidecar for cycle, objective, separation-stage and best-layout restart metadata.")
+    ap.add_argument("--resume-state-json", default=None,
+                    help="Optional checkpoint JSON whose cycle and progressive-separation state should be resumed.")
+    ap.add_argument("--best-checkpoint-gephi", default=None,
+                    help="Optional atomic GEXF retaining the best state at the most advanced separation level.")
+    ap.add_argument("--cycle-offset", type=int, default=0,
+                    help="Completed global cycles before this invocation; used for numbering and non-repeating random seeds.")
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--out-xgmml", default=None, help="Optional output XGMML file path (Cytoscape).")
     ap.add_argument("--out-nodes-csv", default=None, help="Optional output CSV with node coords & barcodes.")
     ap.add_argument("--out-edges-csv", default=None, help="Optional output CSV with edge data.")
+    ap.add_argument(
+        "--edge-weighting",
+        choices=["none", "boltzmann"],
+        default="none",
+        help="Apply relative activation-barrier weighting to edge attraction (default: none).",
+    )
+    ap.add_argument(
+        "--node-energy-column",
+        default="Relative Energy (kJ/mol)",
+        help="Nodes CSV column containing energies relative to the lowest-energy ground-state node.",
+    )
+    ap.add_argument(
+        "--ts-energy-column",
+        default="Relative TS Energy (kJ/mol)",
+        help="Edges CSV column containing TS energies relative to the lowest-energy ground-state node.",
+    )
+    ap.add_argument("--temperature-k", type=float, default=298.15, help="Temperature in kelvin for Boltzmann weighting.")
+    ap.add_argument(
+        "--spring-weight-floor-ratio",
+        type=float,
+        default=0.05,
+        help="Minimum raw attraction relative to the lowest-barrier edge (0 < value <= 1).",
+    )
+    ap.add_argument(
+        "--missing-node-energy-policy",
+        choices=["error", "floor"],
+        default="error",
+        help="Handling of missing node energies in Boltzmann mode: reject inputs or retain nodes with floor-weight edges.",
+    )
     args = ap.parse_args()
 
+    global LAYOUT_EDGE_OBJECTIVE_SCOPE
+    LAYOUT_EDGE_OBJECTIVE_SCOPE = args.edge_objective_scope
     verbose = args.verbose
+    if args.cycle_offset < 0:
+        raise ValueError("--cycle-offset must be non-negative.")
+    if args.separation_project_every <= 0 or args.separation_project_iters <= 0:
+        raise ValueError("Progressive separation cadence and iteration counts must be positive.")
+    separation_levels = parse_separation_levels(args.separation_levels, args.min_sep)
+    resume_state = {}
+    if args.resume_state_json:
+        resume_state = json.loads(Path(args.resume_state_json).read_text(encoding="utf-8"))
+        if args.cycle_offset == 0:
+            args.cycle_offset = int(resume_state.get("completed_global_cycle", 0))
+        objective_state = resume_state.get("objective", {})
+        if args.objective_reference_crossings is None:
+            args.objective_reference_crossings = objective_state.get("initial_crossings")
+        if args.objective_reference_weighted_length is None:
+            args.objective_reference_weighted_length = objective_state.get("initial_weighted_length")
+        if args.objective_reference_spacing_penalty is None:
+            args.objective_reference_spacing_penalty = objective_state.get("initial_spacing_penalty")
+    if args.checkpoint_gephi and args.checkpoint_state_json is None:
+        args.checkpoint_state_json = str(Path(args.checkpoint_gephi).with_name(Path(args.checkpoint_gephi).name + ".state.json"))
+    if args.checkpoint_gephi and args.best_checkpoint_gephi is None:
+        checkpoint_path = Path(args.checkpoint_gephi)
+        args.best_checkpoint_gephi = str(checkpoint_path.with_name(checkpoint_path.stem + "_best" + checkpoint_path.suffix))
     if args.crossing_mode is None:
         args.crossing_mode = "estimate" if args.fast_mode else "exact"
     elif args.fast_mode and args.crossing_mode != "estimate":
@@ -2274,7 +3057,16 @@ def main():
     set_crossing_policy(args.crossing_mode, args.fast_sample_size, args.seed, exact_every=args.crossing_exact_every)
 
     print("[START] Reading graph", flush=True)
-    G, nodes_raw, edges_df = read_graph(args.nodes, args.edges)
+    G, nodes_raw, edges_df = read_graph(
+        args.nodes,
+        args.edges,
+        edge_weighting=args.edge_weighting,
+        node_energy_column=args.node_energy_column,
+        ts_energy_column=args.ts_energy_column,
+        temperature_k=args.temperature_k,
+        spring_weight_floor_ratio=args.spring_weight_floor_ratio,
+        missing_node_energy_policy=args.missing_node_energy_policy,
+    )
     print(f"[INFO] Nodes={G.number_of_nodes()} Edges={G.number_of_edges()}", flush=True)
 
     print("[START] Annotating nodes", flush=True)
@@ -2301,7 +3093,7 @@ def main():
         else:
             A_side, B_side = balanced_bisection_pairs(H, seed=args.seed)
 
-    layout_scale = compute_layout_scale(G, min_sep=args.min_sep)
+    layout_scale = compute_layout_scale(G, min_sep=args.min_sep, layout_scale_factor=args.layout_scale_factor)
     print("[START] Preparing initial layout or resuming checkpoint", flush=True)
     if args.resume_gephi:
         print(f"[START] Resuming coordinates from {args.resume_gephi}", flush=True)
@@ -2327,7 +3119,7 @@ def main():
     else:
         print("[START] Laying out representative graph with size-aware scale", flush=True)
         rep_of, reps, Grep = rep_graph_from_partition(G, pairs, A_side)
-        layout_scale = compute_layout_scale(Grep, min_sep=args.min_sep)
+        layout_scale = compute_layout_scale(Grep, min_sep=args.min_sep, layout_scale_factor=args.layout_scale_factor)
         reps_pos = layout_reps_scale_aware(Grep, layout_scale=layout_scale, sweeps=args.sweeps, seed=args.seed)
 
         if args.axis_lateral_gap is not None and args.axis_lateral_gap > 0.0:
@@ -2362,10 +3154,114 @@ def main():
 
     best_pos = dict(pos)
     current_cross = count_edge_crossings(G, best_pos)
+    resume_start_crossings = current_cross
+    resume_start_weighted_length = _global_edge_length_score(G, best_pos, edges_all) / max(float(args.min_sep), 1e-9)
+    resume_start_spacing_penalty = _global_spacing_penalty(best_pos, args.min_sep)
+    initial_crossings = args.objective_reference_crossings if args.objective_reference_crossings is not None else resume_start_crossings
+    initial_weighted_length = args.objective_reference_weighted_length if args.objective_reference_weighted_length is not None else resume_start_weighted_length
+    initial_spacing_penalty = args.objective_reference_spacing_penalty if args.objective_reference_spacing_penalty is not None else resume_start_spacing_penalty
+    configure_layout_objective(
+        args.objective_mode,
+        args.objective_crossing_weight,
+        args.objective_edge_length_weight,
+        args.objective_spacing_weight,
+        args.soft_separation_factor,
+        initial_crossings=initial_crossings,
+        initial_weighted_length=initial_weighted_length,
+        initial_spacing_penalty=initial_spacing_penalty,
+    )
     current_layout_score = evaluate_layout_score(G, best_pos, edges_all, sides=sides, min_sep=args.min_sep)
+    print(f"[OBJECTIVE] {OBJECTIVE_CONFIGURATION}", flush=True)
     print(f"[REFINE] starting crossings{'~' if args.crossing_mode != 'exact' else ''}={current_cross}{' (sampled)' if args.crossing_mode != 'exact' else ''}", flush=True)
 
+    separation_stage_index = 0
+    if args.separation_mode == "progressive":
+        saved_index = resume_state.get("separation", {}).get("stage_index")
+        if saved_index is not None:
+            separation_stage_index = min(max(0, int(saved_index)), len(separation_levels) - 1)
+        else:
+            while separation_stage_index < len(separation_levels) - 1:
+                diag = separation_diagnostics(best_pos, separation_levels[separation_stage_index])
+                if diag["remaining_violations"]:
+                    break
+                separation_stage_index += 1
+        active_separation = separation_levels[separation_stage_index]
+        active_separation_diag = separation_diagnostics(best_pos, active_separation)
+        print(
+            f"[SEPARATION] progressive levels={separation_levels} active={active_separation:.6f} "
+            f"violations={active_separation_diag['remaining_violations']} "
+            f"deficit={active_separation_diag['total_squared_deficit']:.9f}",
+            flush=True,
+        )
+    else:
+        active_separation = 0.0
+        active_separation_diag = separation_diagnostics(best_pos, 0.0)
+
+    def prepare_candidate_for_scoring(base_pos, candidate_pos, label):
+        if args.separation_mode != "progressive":
+            return candidate_pos, True
+        repaired, repaired_diag, was_projected, allowed = project_candidate_for_separation(
+            base_pos,
+            candidate_pos,
+            pairs,
+            sides,
+            active_separation,
+            max_iter=args.separation_project_iters,
+            stall_limit=args.separation_stall_passes,
+        )
+        if was_projected:
+            status = "repaired" if allowed else "rejected"
+            print(
+                f"  [SEPARATION] {label} candidate {status} before scoring: "
+                f"threshold={active_separation:.6f} "
+                f"violations={repaired_diag['remaining_violations']} "
+                f"deficit={repaired_diag['total_squared_deficit']:.9f} "
+                f"iterations={repaired_diag['iterations']}",
+                flush=True,
+            )
+        return repaired, allowed
+
+    best_checkpoint_rank = tuple(resume_state.get("best_rank", [-1, float("-inf"), float("-inf")]))
+    saved_best_valid_objective = resume_state.get("best_valid_objective")
+    best_valid_objective = (
+        float(saved_best_valid_objective) if saved_best_valid_objective is not None else float("inf")
+    )
+    best_valid_cycle = resume_state.get("best_valid_cycle")
+    initial_full_diag = separation_diagnostics(best_pos, args.min_sep)
+    if initial_full_diag["remaining_violations"] == 0 and not math.isfinite(best_valid_objective):
+        best_valid_objective = float(current_layout_score)
+        best_valid_cycle = int(args.cycle_offset)
+
+    def checkpoint_state(completed_global_cycle, separation_diag, best_rank):
+        return {
+            "version": 1,
+            "completed_global_cycle": int(completed_global_cycle),
+            "seed": int(args.seed),
+            "objective": dict(OBJECTIVE_CONFIGURATION),
+            "separation": {
+                "mode": args.separation_mode,
+                "levels": list(separation_levels),
+                "stage_index": int(separation_stage_index),
+                "active_threshold": float(active_separation),
+                "diagnostics": dict(separation_diag),
+            },
+            "best_rank": list(best_rank),
+            "best_valid_objective": None if not math.isfinite(best_valid_objective) else float(best_valid_objective),
+            "best_valid_cycle": best_valid_cycle,
+            "parameters": {
+                "min_sep": float(args.min_sep),
+                "crossing_mode": args.crossing_mode,
+                "fast_sample_size": int(args.fast_sample_size),
+                "separation_project_every": int(args.separation_project_every),
+                "separation_project_iters": int(args.separation_project_iters),
+                "transactional_valid_cycles": bool(args.transactional_valid_cycles),
+                "edge_objective_scope": args.edge_objective_scope,
+            },
+        }
+
     step_counter = 0
+    cycle_metrics = []
+    consecutive_stalled_cycles = 0
     exact_every = max(1, int(args.crossing_exact_every))
 
     def maybe_force_exact(final_cycle: bool = False):
@@ -2377,14 +3273,40 @@ def main():
         elif args.crossing_mode == "step_interval" and step_counter > 0 and (step_counter % exact_every == 0):
             current_cross = count_edge_crossings(G, best_pos, force_exact=True)
 
-    def after_step():
+    def report_stage_diagnostics(label, retained_before):
+        if args.stage_diagnostics and label is not None and retained_before is not None:
+            retained_diag = separation_diagnostics(best_pos, active_separation)
+            retained_score = evaluate_layout_score(
+                G, best_pos, edges_all, sides=sides, min_sep=args.min_sep
+            )
+            print(
+                f"[STAGE DIAGNOSTICS] {label}: "
+                f"retained_max_shift={max_node_shift(retained_before, best_pos):.6f} "
+                f"objective={retained_score:.12f} "
+                f"threshold={active_separation:.6f} "
+                f"violations={retained_diag['remaining_violations']} "
+                f"deficit={retained_diag['total_squared_deficit']:.9f}",
+                flush=True,
+            )
+
+    def after_step(label=None, retained_before=None):
         nonlocal step_counter, current_cross
         step_counter += 1
         maybe_force_exact()
+        report_stage_diagnostics(label, retained_before)
 
     for cycle in range(args.refine_cycles):
-        print(f"[REFINE] cycle {cycle+1}/{args.refine_cycles} starting (current crossings={current_cross})", flush=True)
+        global_cycle = args.cycle_offset + cycle + 1
+        final_requested_cycle = args.cycle_offset + args.refine_cycles
+        print(f"[REFINE] cycle {global_cycle}/{final_requested_cycle} starting (current crossings={current_cross})", flush=True)
         cycle_start_pos = dict(best_pos)
+        cycle_start_score = float(current_layout_score)
+        cycle_start_cross = current_cross
+        cycle_start_comp_orderings = copy.deepcopy(comp_orderings)
+        cycle_start_stage_index = int(separation_stage_index)
+        cycle_start_active_separation = float(active_separation)
+        cycle_start_full_diag = separation_diagnostics(cycle_start_pos, args.min_sep)
+        cycle_start_full_valid = cycle_start_full_diag["remaining_violations"] == 0
         cycle_checkpoint_pos = None
         if args.checkpoint_gephi and Path(args.checkpoint_gephi).exists():
             try:
@@ -2394,16 +3316,21 @@ def main():
                     print(f"[WARN] Could not load checkpoint for convergence check: {exc}", flush=True)
         improved_cycle = False
 
-        print(f"[REFINE][cycle {cycle+1}] Step: chiral Y-swaps (max_iters={args.chiral_swap_iters})", flush=True)
+        print(f"[REFINE][cycle {global_cycle}] Step: chiral Y-swaps (max_iters={args.chiral_swap_iters})", flush=True)
+        stage_start_pos = dict(best_pos)
         pos_chiral, ch_improved, ch_before, ch_after = optimize_chiral_pair_swaps(
-            G, best_pos, pairs, sides, edges_all, edge_bboxes,
-            max_iters=args.chiral_swap_iters, seed=args.seed + cycle, tries_per_iter=None, verbose=verbose,
+            G, dict(best_pos), pairs, sides, edges_all, edge_bboxes,
+            max_iters=args.chiral_swap_iters, seed=args.seed + global_cycle - 1, tries_per_iter=None, verbose=verbose,
             fast_mode=args.fast_mode, sample_size=args.fast_sample_size, min_sep=args.min_sep)
         if ch_improved:
             pos_chiral = match_axis_chiral_stats(pos_chiral, sides)
+            raw_layout_score = evaluate_layout_score(G, pos_chiral, edges_all, sides=sides, min_sep=args.min_sep)
+            separation_ok = False
+            if raw_layout_score < current_layout_score:
+                pos_chiral, separation_ok = prepare_candidate_for_scoring(best_pos, pos_chiral, "chiral Y-swaps")
             new_cross = count_edge_crossings(G, pos_chiral)
             new_layout_score = evaluate_layout_score(G, pos_chiral, edges_all, sides=sides, min_sep=args.min_sep)
-            if new_layout_score < current_layout_score:
+            if separation_ok and new_layout_score < current_layout_score:
                 best_pos = pos_chiral
                 current_cross = new_cross
                 current_layout_score = new_layout_score
@@ -2413,18 +3340,23 @@ def main():
         else:
             if verbose:
                 print("  [RESULT] chiral Y-swaps no improvement", flush=True)
-        after_step()
+        after_step("chiral Y-swaps", stage_start_pos)
 
-        print(f"[REFINE][cycle {cycle+1}] Step: pair-of-pairs swaps (attempts_per_iter={args.pairpair_iters})", flush=True)
+        print(f"[REFINE][cycle {global_cycle}] Step: pair-of-pairs swaps (attempts_per_iter={args.pairpair_iters})", flush=True)
+        stage_start_pos = dict(best_pos)
         pos_pairpair, pp_improved, pp_before, pp_after = optimize_pair_of_pairs_swaps(
-            G, best_pos, pairs, sides, edges_all, edge_bboxes,
-            max_iters=args.pairpair_iters, seed=args.seed + 1000 + cycle, attempts_per_iter=args.pairpair_iters, verbose=verbose,
+            G, dict(best_pos), pairs, sides, edges_all, edge_bboxes,
+            max_iters=args.pairpair_iters, seed=args.seed + 1000 + global_cycle - 1, attempts_per_iter=args.pairpair_iters, verbose=verbose,
             fast_mode=args.fast_mode, sample_size=args.fast_sample_size, min_sep=args.min_sep)
         if pp_improved:
             pos_pairpair = match_axis_chiral_stats(pos_pairpair, sides)
+            raw_layout_score = evaluate_layout_score(G, pos_pairpair, edges_all, sides=sides, min_sep=args.min_sep)
+            separation_ok = False
+            if raw_layout_score < current_layout_score:
+                pos_pairpair, separation_ok = prepare_candidate_for_scoring(best_pos, pos_pairpair, "pair-of-pairs")
             new_cross = count_edge_crossings(G, pos_pairpair)
             new_layout_score = evaluate_layout_score(G, pos_pairpair, edges_all, sides=sides, min_sep=args.min_sep)
-            if new_layout_score < current_layout_score:
+            if separation_ok and new_layout_score < current_layout_score:
                 best_pos = pos_pairpair
                 current_cross = new_cross
                 current_layout_score = new_layout_score
@@ -2434,18 +3366,23 @@ def main():
         else:
             if verbose:
                 print("  [RESULT] pair-of-pairs no improvement", flush=True)
-        after_step()
+        after_step("pair-of-pairs swaps", stage_start_pos)
 
-        print(f"[REFINE][cycle {cycle+1}] Step: enantiomer X-swaps (iters={args.enantiomer_swap_iters})", flush=True)
+        print(f"[REFINE][cycle {global_cycle}] Step: enantiomer X-swaps (iters={args.enantiomer_swap_iters})", flush=True)
+        stage_start_pos = dict(best_pos)
         pos_enant, enant_improved, en_before, en_after = optimize_enantiomer_x_swaps(
-            G, best_pos, pairs, sides, edges_all, edge_bboxes,
-            max_iters=args.enantiomer_swap_iters, seed=args.seed + 5000 + cycle, tries_per_iter=None, verbose=verbose,
+            G, dict(best_pos), pairs, sides, edges_all, edge_bboxes,
+            max_iters=args.enantiomer_swap_iters, seed=args.seed + 5000 + global_cycle - 1, tries_per_iter=None, verbose=verbose,
             fast_mode=args.fast_mode, sample_size=args.fast_sample_size, min_sep=args.min_sep)
         if enant_improved:
             pos_enant = match_axis_chiral_stats(pos_enant, sides)
+            raw_layout_score = evaluate_layout_score(G, pos_enant, edges_all, sides=sides, min_sep=args.min_sep)
+            separation_ok = False
+            if raw_layout_score < current_layout_score:
+                pos_enant, separation_ok = prepare_candidate_for_scoring(best_pos, pos_enant, "enantiomer X-swaps")
             new_cross = count_edge_crossings(G, pos_enant)
             new_layout_score = evaluate_layout_score(G, pos_enant, edges_all, sides=sides, min_sep=args.min_sep)
-            if new_layout_score < current_layout_score:
+            if separation_ok and new_layout_score < current_layout_score:
                 best_pos = pos_enant
                 current_cross = new_cross
                 current_layout_score = new_layout_score
@@ -2455,18 +3392,24 @@ def main():
         else:
             if verbose:
                 print("  [RESULT] enantiomer X-swaps no improvement", flush=True)
-        after_step()
+        after_step("enantiomer X-swaps", stage_start_pos)
 
-        print(f"[REFINE][cycle {cycle+1}] Step: achiral-slot swaps (max_iters={args.swap_iters})", flush=True)
+        print(f"[REFINE][cycle {global_cycle}] Step: achiral-slot swaps (max_iters={args.swap_iters})", flush=True)
+        stage_start_pos = dict(best_pos)
         pos_achiral, ach_cross = optimize_achiral_swaps(
-            G, best_pos, pairs, sides, comp_orderings, achiral_gap,
+            G, dict(best_pos), pairs, sides, copy.deepcopy(comp_orderings), achiral_gap,
             edges_all, edge_bboxes,
-            max_iters=args.swap_iters, seed=args.seed + 2000 + cycle,
-            cross_weight=0.20, gap_weight=args.achiral_gap_weight, nonadj_weight=args.achiral_adjacency_weight, verbose=verbose,
+            max_iters=args.swap_iters, seed=args.seed + 2000 + global_cycle - 1,
+            cross_weight=LAYOUT_CROSSING_WEIGHT, gap_weight=args.achiral_gap_weight, nonadj_weight=args.achiral_adjacency_weight, verbose=verbose,
             fast_mode=args.fast_mode, sample_size=args.fast_sample_size, min_sep=args.min_sep)
         pos_achiral = match_axis_chiral_stats(pos_achiral, sides)
         ach_score = evaluate_layout_score(G, pos_achiral, edges_all, sides=sides, min_sep=args.min_sep)
+        separation_ok = False
         if ach_score < current_layout_score:
+            pos_achiral, separation_ok = prepare_candidate_for_scoring(best_pos, pos_achiral, "achiral-slot swaps")
+            ach_score = evaluate_layout_score(G, pos_achiral, edges_all, sides=sides, min_sep=args.min_sep)
+            ach_cross = count_edge_crossings(G, pos_achiral)
+        if separation_ok and ach_score < current_layout_score:
             best_pos = pos_achiral
             current_cross = ach_cross
             current_layout_score = ach_score
@@ -2476,18 +3419,24 @@ def main():
         else:
             if verbose:
                 print(f"  [RESULT] achiral-slot swaps no improvement (score={ach_score:.3f}, crossings={ach_cross})", flush=True)
-        after_step()
+        after_step("achiral-slot swaps", stage_start_pos)
 
-        print(f"[REFINE][cycle {cycle+1}] Step: pair-block relocation (max_trials={args.pair_relocation_trials})", flush=True)
+        print(f"[REFINE][cycle {global_cycle}] Step: pair-block relocation (max_trials={args.pair_relocation_trials})", flush=True)
+        stage_start_pos = dict(best_pos)
         pos_reloc, relocated, pre_reloc_cross, post_reloc_cross = pair_block_relocation_refinement(
-            G, best_pos, sides, comp_orderings, achiral_gap,
+            G, dict(best_pos), sides, copy.deepcopy(comp_orderings), achiral_gap,
             edges_all, edge_bboxes,
-            max_trials=args.pair_relocation_trials, seed=args.seed + 3000 + cycle, verbose=verbose,
+            max_trials=args.pair_relocation_trials, seed=args.seed + 3000 + global_cycle - 1, verbose=verbose,
             fast_mode=args.fast_mode, sample_size=args.fast_sample_size, min_sep=args.min_sep)
         if relocated:
             pos_reloc = match_axis_chiral_stats(pos_reloc, sides)
         pos_reloc_score = evaluate_layout_score(G, pos_reloc, edges_all, sides=sides, min_sep=args.min_sep)
+        separation_ok = False
         if relocated and pos_reloc_score < current_layout_score:
+            pos_reloc, separation_ok = prepare_candidate_for_scoring(best_pos, pos_reloc, "pair-block relocation")
+            pos_reloc_score = evaluate_layout_score(G, pos_reloc, edges_all, sides=sides, min_sep=args.min_sep)
+            post_reloc_cross = count_edge_crossings(G, pos_reloc)
+        if relocated and separation_ok and pos_reloc_score < current_layout_score:
             best_pos = pos_reloc
             current_cross = post_reloc_cross
             current_layout_score = pos_reloc_score
@@ -2497,16 +3446,25 @@ def main():
         else:
             if verbose:
                 print("  [RESULT] pair-block relocation no improvement", flush=True)
-        after_step()
+        after_step("pair-block relocation", stage_start_pos)
 
         axis_min_gap = args.axis_min_gap if args.axis_min_gap is not None else (0.9 * args.min_sep)
-        print(f"[REFINE][cycle {cycle+1}] Step: axis block adjust (min_axis_gap={axis_min_gap})", flush=True)
-        best_pos, comp_orderings = adjust_axis_components_min_gap(G, best_pos, sides, comp_orderings, achiral_gap, axis_min_gap, max_iters=1)
-        best_pos = spread_axis_nodes_min_sep(best_pos, sides, args.min_sep)
-        best_pos = match_axis_chiral_stats(best_pos, sides)
-        post_adjust_cross = count_edge_crossings(G, best_pos)
-        post_adjust_score = evaluate_layout_score(G, best_pos, edges_all, sides=sides, min_sep=args.min_sep)
+        print(f"[REFINE][cycle {global_cycle}] Step: axis block adjust (min_axis_gap={axis_min_gap})", flush=True)
+        stage_start_pos = dict(best_pos)
+        axis_candidate, comp_orderings_candidate = adjust_axis_components_min_gap(
+            G, dict(best_pos), sides, copy.deepcopy(comp_orderings), achiral_gap, axis_min_gap, max_iters=1
+        )
+        axis_candidate = spread_axis_nodes_min_sep(axis_candidate, sides, args.min_sep)
+        axis_candidate = match_axis_chiral_stats(axis_candidate, sides)
+        post_adjust_score = evaluate_layout_score(G, axis_candidate, edges_all, sides=sides, min_sep=args.min_sep)
+        separation_ok = False
         if post_adjust_score < current_layout_score:
+            axis_candidate, separation_ok = prepare_candidate_for_scoring(best_pos, axis_candidate, "axis adjust")
+            post_adjust_score = evaluate_layout_score(G, axis_candidate, edges_all, sides=sides, min_sep=args.min_sep)
+        post_adjust_cross = count_edge_crossings(G, axis_candidate)
+        if separation_ok and post_adjust_score < current_layout_score:
+            best_pos = axis_candidate
+            comp_orderings = comp_orderings_candidate
             current_cross = post_adjust_cross
             current_layout_score = post_adjust_score
             improved_cycle = True
@@ -2515,13 +3473,14 @@ def main():
         else:
             if verbose:
                 print(f"  [RESULT] axis adjust no improvement (score={post_adjust_score:.3f}, crossings={post_adjust_cross})", flush=True)
-        after_step()
+        after_step("axis block adjust", stage_start_pos)
 
         if args.chiral_relax:
+            stage_start_pos = dict(best_pos)
             pos_relax, relax_improved, relax_before, relax_after = optimize_chiral_coordinate_relaxation(
-                G, best_pos, pairs, sides, edges_all, edge_bboxes,
+                G, dict(best_pos), pairs, sides, edges_all, edge_bboxes,
                 max_iters=args.chiral_relax_iters,
-                seed=args.seed + 7000 + cycle,
+                seed=args.seed + 7000 + global_cycle - 1,
                 tries_per_iter=None,
                 x_rate=args.chiral_relax_x_rate,
                 y_rate=args.chiral_relax_y_rate,
@@ -2537,7 +3496,12 @@ def main():
             )
             pos_relax = match_axis_chiral_stats(pos_relax, sides)
             relax_score = evaluate_layout_score(G, pos_relax, edges_all, sides=sides, min_sep=args.min_sep)
+            separation_ok = False
             if relax_score < current_layout_score:
+                pos_relax, separation_ok = prepare_candidate_for_scoring(best_pos, pos_relax, "chiral relaxation")
+                relax_score = evaluate_layout_score(G, pos_relax, edges_all, sides=sides, min_sep=args.min_sep)
+                relax_after = count_edge_crossings(G, pos_relax)
+            if separation_ok and relax_score < current_layout_score:
                 best_pos = pos_relax
                 current_cross = relax_after
                 current_layout_score = relax_score
@@ -2546,16 +3510,22 @@ def main():
                     print(f"  [RESULT] chiral relaxation improved layout -> score={current_layout_score:.3f}, crossings={current_cross}", flush=True)
             elif verbose:
                 print(f"  [RESULT] chiral relaxation no improvement (score={relax_score:.3f})", flush=True)
-            after_step()
+            after_step("chiral relaxation", stage_start_pos)
 
-            print(f"[REFINE][cycle {cycle+1}] Step: pair flips", flush=True)
+            print(f"[REFINE][cycle {global_cycle}] Step: pair flips", flush=True)
+            stage_start_pos = dict(best_pos)
             pos_flip, flip_improved, flip_before, flip_after = optimize_chiral_pair_flips(
-                G, best_pos, pairs, sides, edges_all, edge_bboxes,
-                max_iters=50, seed=args.seed + 9000 + cycle, tries_per_iter=None, verbose=verbose,
+                G, dict(best_pos), pairs, sides, edges_all, edge_bboxes,
+                max_iters=args.pair_flip_iters, seed=args.seed + 9000 + global_cycle - 1, tries_per_iter=None, verbose=verbose,
                 fast_mode=args.fast_mode, sample_size=args.fast_sample_size, min_sep=args.min_sep)
             pos_flip = match_axis_chiral_stats(pos_flip, sides)
             flip_score = evaluate_layout_score(G, pos_flip, edges_all, sides=sides, min_sep=args.min_sep)
+            separation_ok = False
             if flip_score < current_layout_score:
+                pos_flip, separation_ok = prepare_candidate_for_scoring(best_pos, pos_flip, "pair flips")
+                flip_score = evaluate_layout_score(G, pos_flip, edges_all, sides=sides, min_sep=args.min_sep)
+                flip_after = count_edge_crossings(G, pos_flip)
+            if separation_ok and flip_score < current_layout_score:
                 best_pos = pos_flip
                 current_cross = flip_after
                 current_layout_score = flip_score
@@ -2564,11 +3534,137 @@ def main():
                     print(f"  [RESULT] pair flips improved layout -> score={current_layout_score:.3f}, crossings={current_cross}", flush=True)
             elif verbose:
                 print(f"  [RESULT] pair flips no improvement (score={flip_score:.3f})", flush=True)
-            after_step()
+            after_step("pair flips", stage_start_pos)
 
-        best_pos = equalize_hemi_span(best_pos, sides, tolerance=args.hemi_span_tol, min_nodes=args.hemi_min_nodes, hemi_max_scale=args.hemi_max_scale, target_ratio=args.hemi_target_ratio)
-        best_pos = match_axis_chiral_stats(best_pos, sides)
-        current_layout_score = evaluate_layout_score(G, best_pos, edges_all, sides=sides, min_sep=args.min_sep)
+        stage_start_pos = dict(best_pos)
+        span_candidate = equalize_hemi_span(
+            dict(best_pos), sides, tolerance=args.hemi_span_tol, min_nodes=args.hemi_min_nodes,
+            hemi_max_scale=args.hemi_max_scale, target_ratio=args.hemi_target_ratio
+        )
+        span_candidate = match_axis_chiral_stats(span_candidate, sides)
+        span_score = evaluate_layout_score(G, span_candidate, edges_all, sides=sides, min_sep=args.min_sep)
+        separation_ok = False
+        if span_score < current_layout_score:
+            span_candidate, separation_ok = prepare_candidate_for_scoring(best_pos, span_candidate, "hemi-span adjustment")
+            span_score = evaluate_layout_score(G, span_candidate, edges_all, sides=sides, min_sep=args.min_sep)
+        if separation_ok and span_score < current_layout_score:
+            best_pos = span_candidate
+            current_cross = count_edge_crossings(G, best_pos)
+            current_layout_score = span_score
+            improved_cycle = True
+        report_stage_diagnostics("hemi-span adjustment", stage_start_pos)
+
+        if args.separation_mode == "progressive":
+            active_separation_diag = separation_diagnostics(best_pos, active_separation)
+            should_project = (
+                active_separation_diag["remaining_violations"] > 0
+                and (cycle == 0 or global_cycle % args.separation_project_every == 0)
+            )
+            if should_project:
+                before_projection = active_separation_diag
+                projected_pos, projected_diag = enforce_minimum_separation_mirror_preserving(
+                    best_pos,
+                    pairs,
+                    sides,
+                    min_sep=active_separation,
+                    max_iter=args.separation_project_iters,
+                    stall_limit=args.separation_stall_passes,
+                )
+                if separation_not_worse(before_projection, projected_diag) and (
+                    projected_diag["total_squared_deficit"] + 1e-12
+                    < before_projection["total_squared_deficit"]
+                    or projected_diag["remaining_violations"] == 0
+                ):
+                    best_pos = projected_pos
+                    active_separation_diag = projected_diag
+                    current_layout_score = evaluate_layout_score(
+                        G, best_pos, edges_all, sides=sides, min_sep=args.min_sep
+                    )
+                    improved_cycle = True
+                    print(
+                        f"[SEPARATION][cycle {global_cycle}] projected threshold={active_separation:.6f} "
+                        f"violations={before_projection['remaining_violations']}->{projected_diag['remaining_violations']} "
+                        f"deficit={before_projection['total_squared_deficit']:.9f}->"
+                        f"{projected_diag['total_squared_deficit']:.9f} iterations={projected_diag['iterations']}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[SEPARATION][cycle {global_cycle}] projection made no retained improvement at "
+                        f"threshold={active_separation:.6f}",
+                        flush=True,
+                    )
+
+            active_separation_diag = separation_diagnostics(best_pos, active_separation)
+            while active_separation_diag["remaining_violations"] == 0 and separation_stage_index < len(separation_levels) - 1:
+                separation_stage_index += 1
+                active_separation = separation_levels[separation_stage_index]
+                active_separation_diag = separation_diagnostics(best_pos, active_separation)
+                print(
+                    f"[SEPARATION][cycle {global_cycle}] advanced to threshold={active_separation:.6f} "
+                    f"violations={active_separation_diag['remaining_violations']} "
+                    f"deficit={active_separation_diag['total_squared_deficit']:.9f}",
+                    flush=True,
+                )
+
+        if args.transactional_valid_cycles and cycle_start_full_valid:
+            end_full_diag = separation_diagnostics(best_pos, args.min_sep)
+            if end_full_diag["remaining_violations"] > 0:
+                repaired_pos, repaired_diag = enforce_minimum_separation_mirror_preserving(
+                    best_pos,
+                    pairs,
+                    sides,
+                    min_sep=args.min_sep,
+                    max_iter=args.final_separation_iters,
+                    stall_limit=args.separation_stall_passes,
+                )
+                if repaired_diag["remaining_violations"] == 0:
+                    best_pos = repaired_pos
+                    end_full_diag = repaired_diag
+                    current_layout_score = evaluate_layout_score(
+                        G, best_pos, edges_all, sides=sides, min_sep=args.min_sep
+                    )
+                    active_separation_diag = separation_diagnostics(best_pos, active_separation)
+                    print(
+                        f"[TRANSACTION][cycle {global_cycle}] repaired final candidate to full separation "
+                        f"in {repaired_diag['iterations']} iterations before cycle scoring.",
+                        flush=True,
+                    )
+                else:
+                    end_full_diag = repaired_diag
+
+            current_layout_score = evaluate_layout_score(
+                G, best_pos, edges_all, sides=sides, min_sep=args.min_sep
+            )
+            end_full_valid = end_full_diag["remaining_violations"] == 0
+            if not transactional_cycle_is_better(
+                cycle_start_full_valid,
+                cycle_start_score,
+                end_full_valid,
+                current_layout_score,
+            ):
+                rejected_score = current_layout_score
+                rejected_violations = end_full_diag["remaining_violations"]
+                best_pos = cycle_start_pos
+                current_layout_score = cycle_start_score
+                current_cross = cycle_start_cross
+                comp_orderings = cycle_start_comp_orderings
+                separation_stage_index = cycle_start_stage_index
+                active_separation = cycle_start_active_separation
+                active_separation_diag = separation_diagnostics(best_pos, active_separation)
+                improved_cycle = False
+                print(
+                    f"[TRANSACTION][cycle {global_cycle}] rolled back final cycle candidate: "
+                    f"start_score={cycle_start_score:.12f} end_score={rejected_score:.12f} "
+                    f"end_full_separation_violations={rejected_violations}.",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[TRANSACTION][cycle {global_cycle}] retained valid final cycle: "
+                    f"score={cycle_start_score:.12f}->{current_layout_score:.12f}.",
+                    flush=True,
+                )
 
         edges_all, edge_bboxes = build_edge_cache(G, best_pos)
         current_cross = count_edge_crossings(G, best_pos)
@@ -2578,30 +3674,145 @@ def main():
             current_cross = count_edge_crossings(G, best_pos, force_exact=True)
 
         cycle_shift = max_node_shift(cycle_start_pos, best_pos)
-        print(f"[REFINE] cycle {cycle+1} complete: current_crossings={current_cross} improved_cycle={improved_cycle} max_node_shift={cycle_shift:.6f}", flush=True)
+        print(f"[REFINE] cycle {global_cycle} complete: current_crossings={current_cross} improved_cycle={improved_cycle} max_node_shift={cycle_shift:.6f}", flush=True)
+        span_metrics = axis_chiral_span_metrics(best_pos, sides)
+        cycle_record = {
+            "cycle": global_cycle,
+            "local_cycle": cycle + 1,
+            "crossings": current_cross,
+            "crossings_fraction_of_initial": float(current_cross) / max(float(initial_crossings), 1.0),
+            "weighted_edge_length_score": _global_edge_length_score(G, best_pos, edges_all) / max(float(args.min_sep), 1e-9),
+            "weighted_edge_length_fraction_of_initial": (_global_edge_length_score(G, best_pos, edges_all) / max(float(args.min_sep), 1e-9)) / max(float(initial_weighted_length), 1e-12),
+            "soft_spacing_penalty": _global_spacing_penalty(best_pos, args.min_sep),
+            "objective_score": current_layout_score,
+            "max_node_shift": cycle_shift,
+            "separation_threshold": active_separation,
+            "separation_violations": active_separation_diag["remaining_violations"],
+            "separation_minimum_distance": active_separation_diag["minimum_distance"],
+            "separation_total_squared_deficit": active_separation_diag["total_squared_deficit"],
+            **span_metrics,
+        }
+        cycle_metrics.append(cycle_record)
+        print(f"[CYCLE METRICS] {cycle_record}", flush=True)
+
+        cycle_full_valid = separation_diagnostics(best_pos, args.min_sep)["remaining_violations"] == 0
+        best_valid_improved = False
+        if cycle_full_valid and current_layout_score < best_valid_objective - 1e-12:
+            best_valid_objective = float(current_layout_score)
+            best_valid_cycle = int(global_cycle)
+            best_valid_improved = True
+            print(
+                f"[CONVERGENCE] new best valid objective={best_valid_objective:.12f} "
+                f"at cycle {best_valid_cycle}.",
+                flush=True,
+            )
+
+        candidate_rank = (
+            int(separation_stage_index),
+            -float(active_separation_diag["total_squared_deficit"]),
+            -float(current_layout_score),
+        )
+        if args.best_checkpoint_gephi and candidate_rank > best_checkpoint_rank:
+            best_written = write_gexf_atomic(G, best_pos, args.best_checkpoint_gephi)
+            if best_written == Path(args.best_checkpoint_gephi):
+                best_checkpoint_rank = candidate_rank
+                print(f"[CHECKPOINT] wrote best checkpoint -> {best_written}", flush=True)
+            else:
+                print(
+                    "[CHECKPOINT] best destination remained locked; recovery copy was written and "
+                    "the best rank was not advanced so the primary path will be retried next cycle.",
+                    flush=True,
+                )
 
         if args.checkpoint_gephi and ((cycle + 1) % max(1, args.checkpoint_every) == 0):
-            write_gexf_with_viz(G, best_pos, args.checkpoint_gephi)
-            print(f"[CHECKPOINT] wrote checkpoint -> {args.checkpoint_gephi}", flush=True)
+            checkpoint_written = write_gexf_atomic(G, best_pos, args.checkpoint_gephi)
+            if checkpoint_written == Path(args.checkpoint_gephi):
+                print(f"[CHECKPOINT] wrote checkpoint -> {checkpoint_written}", flush=True)
+            else:
+                print(f"[CHECKPOINT] wrote recovery checkpoint -> {checkpoint_written}", flush=True)
+            if args.checkpoint_state_json and checkpoint_written == Path(args.checkpoint_gephi):
+                state_written = write_json_atomic(
+                    checkpoint_state(global_cycle, active_separation_diag, best_checkpoint_rank),
+                    args.checkpoint_state_json,
+                )
+                print(f"[CHECKPOINT] wrote state -> {state_written}", flush=True)
+            elif args.checkpoint_state_json:
+                print(
+                    "[CHECKPOINT] state JSON was not advanced because the primary GEXF remained locked; "
+                    "the recovery GEXF is self-contained.",
+                    flush=True,
+                )
 
-        if cycle_checkpoint_pos is not None and positions_exactly_equal(best_pos, cycle_checkpoint_pos):
-            print(f"[REFINE] coordinates unchanged from checkpoint at end of cycle {cycle+1}; stopping early.", flush=True)
-            break
+        if not args.run_all_refine_cycles and args.transactional_valid_cycles:
+            if cycle_full_valid:
+                if best_valid_improved:
+                    consecutive_stalled_cycles = 0
+                else:
+                    consecutive_stalled_cycles += 1
+                    patience = max(1, int(args.convergence_patience))
+                    print(
+                        f"[CONVERGENCE] no new best valid objective for "
+                        f"{consecutive_stalled_cycles}/{patience} consecutive valid cycles.",
+                        flush=True,
+                    )
+                    if consecutive_stalled_cycles >= patience:
+                        print(
+                            f"[REFINE] best-valid convergence patience reached at cycle {global_cycle}; "
+                            f"stopping early (best cycle {best_valid_cycle}).",
+                            flush=True,
+                        )
+                        break
+            else:
+                consecutive_stalled_cycles = 0
+        elif not args.run_all_refine_cycles:
+            stall_reasons = []
+            if cycle_checkpoint_pos is not None and positions_exactly_equal(best_pos, cycle_checkpoint_pos):
+                stall_reasons.append("coordinates unchanged from checkpoint")
+            if cycle_shift <= args.cycle_shift_tol:
+                stall_reasons.append(
+                    f"maximum node shift {cycle_shift:.6f} <= tolerance {args.cycle_shift_tol:.6f}"
+                )
+            if not improved_cycle:
+                stall_reasons.append("no accepted improvement")
+            if stall_reasons:
+                consecutive_stalled_cycles += 1
+                patience = max(1, int(args.convergence_patience))
+                print(
+                    f"[REFINE] stalled cycle {consecutive_stalled_cycles}/{patience}: "
+                    + "; ".join(stall_reasons),
+                    flush=True,
+                )
+                if consecutive_stalled_cycles >= patience:
+                    print(
+                        f"[REFINE] convergence patience reached at cycle {global_cycle}; stopping early.",
+                        flush=True,
+                    )
+                    break
+            else:
+                consecutive_stalled_cycles = 0
 
-        if cycle_shift <= args.cycle_shift_tol:
-            print(f"[REFINE] maximum node shift {cycle_shift:.6f} <= tol {args.cycle_shift_tol:.6f}; stopping early.", flush=True)
-            break
-
-        if not improved_cycle:
-            print(f"[REFINE] no improvement in cycle {cycle+1}; stopping early.", flush=True)
-            break
-
-    best_pos = equalize_hemi_span(best_pos, sides, tolerance=args.hemi_span_tol, min_nodes=args.hemi_min_nodes, hemi_max_scale=args.hemi_max_scale, target_ratio=args.hemi_target_ratio)
-    best_pos = match_axis_chiral_stats(best_pos, sides)
-    current_layout_score = evaluate_layout_score(G, best_pos, edges_all, sides=sides, min_sep=args.min_sep)
+    final_balance_candidate = equalize_hemi_span(
+        best_pos, sides, tolerance=args.hemi_span_tol, min_nodes=args.hemi_min_nodes,
+        hemi_max_scale=args.hemi_max_scale, target_ratio=args.hemi_target_ratio
+    )
+    final_balance_candidate = match_axis_chiral_stats(final_balance_candidate, sides)
+    final_balance_score = evaluate_layout_score(
+        G, final_balance_candidate, edges_all, sides=sides, min_sep=args.min_sep
+    )
+    final_balance_ok = False
+    if final_balance_score < current_layout_score:
+        final_balance_candidate, final_balance_ok = prepare_candidate_for_scoring(
+            best_pos, final_balance_candidate, "final hemi-span adjustment"
+        )
+        final_balance_score = evaluate_layout_score(
+            G, final_balance_candidate, edges_all, sides=sides, min_sep=args.min_sep
+        )
+    if final_balance_ok and final_balance_score < current_layout_score:
+        best_pos = final_balance_candidate
+        current_layout_score = final_balance_score
 
     print("[FINAL] Running overlap resolution while keeping axis nodes on x=0 but allowing y-separation", flush=True)
-    pos_after_relax = adjust_positions_with_constraints(G, best_pos, pairs, sides, min_sep=args.min_sep, edge_clearance=args.edge_clearance, max_iter=args.overlap_iter, lr=0.25, fixed_achiral_y=None, axis_lateral_gap=args.axis_lateral_gap)
+    pos_after_relax = adjust_positions_with_constraints(G, best_pos, pairs, sides, min_sep=args.min_sep, edge_clearance=args.edge_clearance, max_iter=args.overlap_iter, lr=0.25, fixed_achiral_y=None, axis_lateral_gap=args.axis_lateral_gap, strict_min_sep_rounds=0)
     pos_after_relax = match_axis_chiral_stats(pos_after_relax, sides)
     pos_after_relax = spread_axis_nodes_min_sep(pos_after_relax, sides, args.min_sep)
 
@@ -2625,11 +3836,71 @@ def main():
     pos_final, mirror_changed = enforce_strict_mirror(pos_after_relax, pairs, sides, tol=1e-8)
     if mirror_changed:
         print("[MIRROR] Adjusted positions to enforce strict mirror symmetry (left-right x sign, identical y).", flush=True)
+    span_before_final_balance = axis_chiral_span_metrics(pos_final, sides)
+    pos_final, span_after_final_balance = expand_chiral_span_to_axis(pos_final, sides, target_ratio=args.hemi_target_ratio)
+    if span_after_final_balance != span_before_final_balance:
+        print(f"[FINAL SPAN] expanded chiral y-span: before={span_before_final_balance} after={span_after_final_balance}", flush=True)
+    print("[FINAL] Enforcing mirror-preserving minimum node separation", flush=True)
+    pos_final, separation_diag = enforce_minimum_separation_mirror_preserving(
+        pos_final, pairs, sides, min_sep=args.min_sep, max_iter=args.final_separation_iters
+    )
+    print(
+        "[SEPARATION] iterations={iterations} remaining_violations={remaining_violations} "
+        "minimum_distance={minimum_distance:.6f}".format(**separation_diag),
+        flush=True,
+    )
+    completed_global_cycle = args.cycle_offset + len(cycle_metrics)
+    if args.checkpoint_gephi:
+        write_gexf_atomic(G, pos_final, args.checkpoint_gephi)
+        if args.checkpoint_state_json:
+            write_json_atomic(
+                checkpoint_state(completed_global_cycle, separation_diag, best_checkpoint_rank),
+                args.checkpoint_state_json,
+            )
+        print(f"[CHECKPOINT] wrote pre-final validated coordinates -> {args.checkpoint_gephi}", flush=True)
+    if separation_diag["remaining_violations"]:
+        raise RuntimeError(
+            "Final mirror-preserving separation did not converge: "
+            f"{separation_diag['remaining_violations']} pairs remain below {args.min_sep}. "
+            "The resumable pre-final checkpoint has been preserved."
+        )
     final_cross = count_edge_crossings(G, pos_final, force_exact=(args.crossing_mode != "estimate"))
     print(f"[FINAL] crossings after all refinements = {final_cross}", flush=True)
 
+    final_weighted_length = _global_edge_length_score(G, pos_final, edges_all) / max(float(args.min_sep), 1e-9)
+    barrier_lengths = []
+    for u, v, data in G.edges(data=True):
+        if "Activation_Barrier" not in data:
+            continue
+        pu, pv = pos_final[u], pos_final[v]
+        barrier_lengths.append((float(data["Activation_Barrier"]), math.hypot(pu[0] - pv[0], pu[1] - pv[1])))
+    barrier_length_spearman = None
+    if len(barrier_lengths) >= 2:
+        barrier_length_spearman = spearman_rank_correlation(barrier_lengths)
+    run_metrics = {
+        "objective": OBJECTIVE_CONFIGURATION,
+        "nodes": G.number_of_nodes(),
+        "edges": G.number_of_edges(),
+        "resume_start_crossings": resume_start_crossings,
+        "resume_start_weighted_edge_length_score": resume_start_weighted_length,
+        "resume_start_soft_spacing_penalty": resume_start_spacing_penalty,
+        "initial_crossings": initial_crossings,
+        "final_crossings": final_cross,
+        "initial_weighted_edge_length_score": OBJECTIVE_CONFIGURATION.get("initial_weighted_length"),
+        "final_weighted_edge_length_score": final_weighted_length,
+        "barrier_vs_edge_length_spearman": barrier_length_spearman,
+        "final_span_before_balance": span_before_final_balance,
+        "final_span_after_balance": axis_chiral_span_metrics(pos_final, sides),
+        "separation": separation_diag,
+        "cycles": cycle_metrics,
+    }
+    print(f"[METRICS] {run_metrics}", flush=True)
+    if args.out_metrics_json:
+        Path(args.out_metrics_json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.out_metrics_json).write_text(json.dumps(run_metrics, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     if args.checkpoint_gephi:
-        write_gexf_with_viz(G, pos_final, args.checkpoint_gephi)
+        write_gexf_atomic(G, pos_final, args.checkpoint_gephi)
         print(f"[CHECKPOINT] wrote final checkpoint -> {args.checkpoint_gephi}", flush=True)
 
     write_gexf_with_viz(G, pos_final, args.out)
@@ -2655,31 +3926,84 @@ LAYOUT_EDGE_LENGTH_WEIGHT = 1.00
 LAYOUT_SPACING_WEIGHT = 8.00
 LAYOUT_SOFT_SEP_FACTOR = 1.35
 LAYOUT_AXIS_GAP_WEIGHT = 0.05
+OBJECTIVE_CONFIGURATION = {"mode": "legacy"}
 
 
-def _local_edge_length_score(best_pos, candidate_pos, moved_nodes, edges_all):
+def configure_layout_objective(mode, crossing_weight, edge_length_weight, spacing_weight, soft_sep_factor,
+                               initial_crossings=None, initial_weighted_length=None, initial_spacing_penalty=None):
+    """Configure comparable objective terms for a single layout run."""
+    global LAYOUT_CROSSING_WEIGHT, LAYOUT_EDGE_LENGTH_WEIGHT, LAYOUT_SPACING_WEIGHT, LAYOUT_SOFT_SEP_FACTOR, OBJECTIVE_CONFIGURATION
+    mode = str(mode).strip().lower()
+    if mode not in {"legacy", "initial_normalized"}:
+        raise ValueError("objective mode must be 'legacy' or 'initial_normalized'.")
+    if soft_sep_factor < 1.0:
+        raise ValueError("soft separation factor must be at least 1.")
+    if mode == "initial_normalized":
+        if initial_crossings is None or initial_weighted_length is None or initial_spacing_penalty is None:
+            raise ValueError("Initial objective references are required for normalized mode.")
+        LAYOUT_CROSSING_WEIGHT = float(crossing_weight) / max(float(initial_crossings), 1.0)
+        LAYOUT_EDGE_LENGTH_WEIGHT = float(edge_length_weight) / max(float(initial_weighted_length), 1e-12)
+        LAYOUT_SPACING_WEIGHT = float(spacing_weight) / max(float(initial_spacing_penalty), 1e-12)
+    else:
+        LAYOUT_CROSSING_WEIGHT = float(crossing_weight)
+        LAYOUT_EDGE_LENGTH_WEIGHT = float(edge_length_weight)
+        LAYOUT_SPACING_WEIGHT = float(spacing_weight)
+    LAYOUT_SOFT_SEP_FACTOR = float(soft_sep_factor)
+    OBJECTIVE_CONFIGURATION = {
+        "mode": mode,
+        "requested_crossing_weight": float(crossing_weight),
+        "requested_edge_length_weight": float(edge_length_weight),
+        "spacing_weight": float(spacing_weight),
+        "soft_sep_factor": float(soft_sep_factor),
+        "initial_crossings": None if initial_crossings is None else float(initial_crossings),
+        "initial_weighted_length": None if initial_weighted_length is None else float(initial_weighted_length),
+        "initial_spacing_penalty": None if initial_spacing_penalty is None else float(initial_spacing_penalty),
+        "effective_crossing_weight": LAYOUT_CROSSING_WEIGHT,
+        "effective_edge_length_weight": LAYOUT_EDGE_LENGTH_WEIGHT,
+        "effective_spacing_weight": LAYOUT_SPACING_WEIGHT,
+        "edge_objective_scope": LAYOUT_EDGE_OBJECTIVE_SCOPE,
+    }
+
+
+def edge_in_length_objective(G, u, v):
+    """Return whether an edge contributes to scientific length objectives."""
+    if LAYOUT_EDGE_OBJECTIVE_SCOPE == "all":
+        return True
+    barrier = G.edges[u, v].get("Activation_Barrier")
+    try:
+        return barrier is not None and math.isfinite(float(barrier))
+    except (TypeError, ValueError):
+        return False
+
+
+def _local_edge_length_score(G, best_pos, candidate_pos, moved_nodes, edges_all):
     moved_set = set(moved_nodes)
     seen = set()
     score = 0.0
-    for u, v in edges_all:
-        if u not in moved_set and v not in moved_set:
-            continue
-        key = (u, v) if u <= v else (v, u)
-        if key in seen:
-            continue
-        seen.add(key)
-        pu = candidate_pos.get(u, best_pos.get(u))
-        pv = candidate_pos.get(v, best_pos.get(v))
-        if pu is None or pv is None:
-            continue
-        score += math.hypot(float(pu[0]) - float(pv[0]), float(pu[1]) - float(pv[1]))
+    for node in moved_set:
+        for other in G[node]:
+            u, v = (node, other) if node <= other else (other, node)
+            key = (u, v)
+            if key in seen:
+                continue
+            seen.add(key)
+            if not edge_in_length_objective(G, u, v):
+                continue
+            pu = candidate_pos.get(u, best_pos.get(u))
+            pv = candidate_pos.get(v, best_pos.get(v))
+            if pu is None or pv is None:
+                continue
+            weight = float(G.edges[u, v].get("Layout_Spring_Weight", 1.0))
+            score += weight * math.hypot(float(pu[0]) - float(pv[0]), float(pu[1]) - float(pv[1]))
     return score
 
 
-def _local_spacing_penalty(best_pos, candidate_pos, moved_nodes, grid, inv_cell, min_sep, soft_sep_factor=LAYOUT_SOFT_SEP_FACTOR):
+def _local_spacing_penalty(best_pos, candidate_pos, moved_nodes, grid, inv_cell, min_sep, soft_sep_factor=None):
     if min_sep <= 0.0:
         return 0.0
     min_sep = float(min_sep)
+    if soft_sep_factor is None:
+        soft_sep_factor = LAYOUT_SOFT_SEP_FACTOR
     soft_sep = max(min_sep, float(min_sep) * float(soft_sep_factor))
     moved_set = set(moved_nodes)
     checked = set()
@@ -2725,22 +4049,27 @@ def _axis_gap_penalty(pos, sides):
     return sum(((g - mean_gap) / mean_gap) ** 2 for g in gaps) / len(gaps)
 
 
-def _global_edge_length_score(pos, edges_all):
+def _global_edge_length_score(G, pos, edges_all):
     total = 0.0
     for u, v in edges_all:
+        if not edge_in_length_objective(G, u, v):
+            continue
         pu = pos.get(u)
         pv = pos.get(v)
         if pu is None or pv is None:
             continue
-        total += math.hypot(float(pu[0]) - float(pv[0]), float(pu[1]) - float(pv[1]))
+        weight = float(G.edges[u, v].get("Layout_Spring_Weight", 1.0))
+        total += weight * math.hypot(float(pu[0]) - float(pv[0]), float(pu[1]) - float(pv[1]))
     return total
 
 
-def _global_spacing_penalty(pos, min_sep, soft_sep_factor=LAYOUT_SOFT_SEP_FACTOR):
+def _global_spacing_penalty(pos, min_sep, soft_sep_factor=None):
     if min_sep <= 0.0 or len(pos) < 2:
         return 0.0
     grid, inv_cell = _build_spatial_hash(pos, min_sep)
     min_sep = float(min_sep)
+    if soft_sep_factor is None:
+        soft_sep_factor = LAYOUT_SOFT_SEP_FACTOR
     soft_sep = max(min_sep, float(min_sep) * float(soft_sep_factor))
     checked = set()
     penalty = 0.0
@@ -2771,14 +4100,20 @@ def _global_spacing_penalty(pos, min_sep, soft_sep_factor=LAYOUT_SOFT_SEP_FACTOR
 
 
 def evaluate_layout_score(G, pos, edges_all, sides=None, min_sep=40.0,
-                          crossing_weight=LAYOUT_CROSSING_WEIGHT,
-                          edge_length_weight=LAYOUT_EDGE_LENGTH_WEIGHT,
-                          spacing_weight=LAYOUT_SPACING_WEIGHT,
-                          axis_gap_weight=LAYOUT_AXIS_GAP_WEIGHT):
+                          crossing_weight=None, edge_length_weight=None,
+                          spacing_weight=None, axis_gap_weight=None):
     if sides is None:
         sides = {}
+    if crossing_weight is None:
+        crossing_weight = LAYOUT_CROSSING_WEIGHT
+    if edge_length_weight is None:
+        edge_length_weight = LAYOUT_EDGE_LENGTH_WEIGHT
+    if spacing_weight is None:
+        spacing_weight = LAYOUT_SPACING_WEIGHT
+    if axis_gap_weight is None:
+        axis_gap_weight = LAYOUT_AXIS_GAP_WEIGHT
     crossings = count_edge_crossings(G, pos)
-    edge_score = _global_edge_length_score(pos, edges_all) / max(float(min_sep), 1e-9)
+    edge_score = _global_edge_length_score(G, pos, edges_all) / max(float(min_sep), 1e-9)
     spacing_score = _global_spacing_penalty(pos, min_sep)
     axis_score = _axis_gap_penalty(pos, sides) if sides else 0.0
     return (
@@ -2902,14 +4237,12 @@ def optimize_chiral_coordinate_relaxation(
             }
 
             moved = {right, left}
-            current_edge_pen = _local_edge_length_score(best_pos, {}, moved, edges_all) / max(float(min_sep), 1e-9)
+            current_edge_pen = _local_edge_length_score(G, best_pos, {}, moved, edges_all) / max(float(min_sep), 1e-9)
             current_repulse_pen = _local_spacing_penalty(best_pos, {}, moved, spatial_grid, inv_cell, repulse_dist)
-            current_spacing = abs(cur_mag - target_mag) + abs(cur_y - target_y)
             current_score = (
                 float(current_cross) * LAYOUT_CROSSING_WEIGHT
-                + edge_length_weight * current_edge_pen
-                + spacing_weight * current_spacing
-                + repulsion_weight * current_repulse_pen
+                + LAYOUT_EDGE_LENGTH_WEIGHT * current_edge_pen
+                + LAYOUT_SPACING_WEIGHT * current_repulse_pen
             )
 
             if delta_fn is not None:
@@ -2919,14 +4252,12 @@ def optimize_chiral_coordinate_relaxation(
             else:
                 new_cross = count_edge_crossings(G, {**best_pos, **candidate_pos})
 
-            new_edge_pen = _local_edge_length_score(best_pos, candidate_pos, moved, edges_all) / max(float(min_sep), 1e-9)
+            new_edge_pen = _local_edge_length_score(G, best_pos, candidate_pos, moved, edges_all) / max(float(min_sep), 1e-9)
             new_repulse_pen = _local_spacing_penalty(best_pos, candidate_pos, moved, spatial_grid, inv_cell, repulse_dist)
-            new_spacing = abs(new_mag - target_mag) + abs(new_y - target_y)
             new_score = (
                 float(new_cross) * LAYOUT_CROSSING_WEIGHT
-                + edge_length_weight * new_edge_pen
-                + spacing_weight * new_spacing
-                + repulsion_weight * new_repulse_pen
+                + LAYOUT_EDGE_LENGTH_WEIGHT * new_edge_pen
+                + LAYOUT_SPACING_WEIGHT * new_repulse_pen
             )
 
             if new_score < current_score:
@@ -2952,16 +4283,22 @@ def optimize_chiral_coordinate_relaxation(
 
 
 def _pair_local_score(G, best_pos, moved, candidate_pos, edges_all, edge_bboxes, current_cross, min_sep,
-                      delta_fn, fast_mode, sample_size, seed, crossing_weight=LAYOUT_CROSSING_WEIGHT,
-                      edge_weight=LAYOUT_EDGE_LENGTH_WEIGHT, spacing_weight=LAYOUT_SPACING_WEIGHT):
+                      delta_fn, fast_mode, sample_size, seed, crossing_weight=None,
+                      edge_weight=None, spacing_weight=None):
+    if crossing_weight is None:
+        crossing_weight = LAYOUT_CROSSING_WEIGHT
+    if edge_weight is None:
+        edge_weight = LAYOUT_EDGE_LENGTH_WEIGHT
+    if spacing_weight is None:
+        spacing_weight = LAYOUT_SPACING_WEIGHT
     if delta_fn is not None:
         delta = delta_fn(G, best_pos, moved, candidate_pos, edges_all, edge_bboxes, _seed_offset=seed)
     else:
         delta = delta_crossings_for_move(G, best_pos, moved, candidate_pos, edges_all, edge_bboxes)
     new_cross = current_cross + delta
     spatial_grid, inv_cell = _build_spatial_hash(best_pos, min_sep)
-    current_edge = _local_edge_length_score(best_pos, {}, moved, edges_all) / max(float(min_sep), 1e-9)
-    new_edge = _local_edge_length_score(best_pos, candidate_pos, moved, edges_all) / max(float(min_sep), 1e-9)
+    current_edge = _local_edge_length_score(G, best_pos, {}, moved, edges_all) / max(float(min_sep), 1e-9)
+    new_edge = _local_edge_length_score(G, best_pos, candidate_pos, moved, edges_all) / max(float(min_sep), 1e-9)
     current_spacing = _local_spacing_penalty(best_pos, {}, moved, spatial_grid, inv_cell, min_sep)
     new_spacing = _local_spacing_penalty(best_pos, candidate_pos, moved, spatial_grid, inv_cell, min_sep)
     current_score = crossing_weight * float(current_cross) + edge_weight * current_edge + spacing_weight * current_spacing
@@ -3298,7 +4635,7 @@ def optimize_achiral_swaps(G, pos, pairs, sides, comp_orderings, achiral_gap,
         gap_var, nonadj = evaluate_spacing_and_nonadj(pos_local, node_to_slot_local)
         return (
             cross_weight * crossings
-            + LAYOUT_EDGE_LENGTH_WEIGHT * (_global_edge_length_score(pos_local, edges_all) / max(float(min_sep), 1e-9))
+            + LAYOUT_EDGE_LENGTH_WEIGHT * (_global_edge_length_score(G, pos_local, edges_all) / max(float(min_sep), 1e-9))
             + LAYOUT_SPACING_WEIGHT * _global_spacing_penalty(pos_local, min_sep)
             + gap_weight * gap_var
             + nonadj_weight * nonadj

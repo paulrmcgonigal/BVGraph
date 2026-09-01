@@ -7,11 +7,12 @@ authors:
   - family-names: McGonigal
     given-names: Paul
 
-version: 1.0
-date-released: 2026
+version: 1.1.0
+date-released: 2026-09-01
 
 repository-code: "https://github.com/paulrmcgonigal/BVGraph"
 
 abstract: >
-  BVGraph is a computational method for generating mirror-symmetric
-  network layouts for bullvalene systems, with 2D and 3D layout capabilities.
+  BVGraph generates mirror-preserving two- and three-dimensional layouts for
+  bullvalene isomer networks, including optional activation-barrier-weighted
+  two-dimensional layouts.
