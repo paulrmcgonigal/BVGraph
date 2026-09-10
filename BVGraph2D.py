@@ -9,10 +9,10 @@ and unpaired (achiral) nodes. The layout enforces:
  - achiral nodes are arranged on the central vertical axis (x == 0)
  - achiral nodes that are directly connected are placed as nearest neighbours on the axis
  - iterative local optimizations that prioritize node spacing and edge compactness, while still reducing edge crossings
- - post-processing to avoid node/edge overlaps and to enforce minimum lateral clearance.
+ - mirror-preserving separation and edge-clearance processing.
 
 Main features:
- - Uses modularity-based community layout for coarse rep placement
+ - Uses a topological spring layout, with optional transition-state guidance
  - Enforces pairwise mirroring for enantiomeric pairs
  - Arranges achiral components as vertical blocks on the central axis with uniform spacing
  - Local move evaluations combine edge-length, spacing, and crossing terms for efficiency
@@ -36,6 +36,7 @@ import json
 import math
 import os
 import random
+import sys
 import time
 from collections import defaultdict
 from typing import Tuple, List, Dict, Set
@@ -46,6 +47,32 @@ from pathlib import Path
 
 R_KJ_MOL_K = 0.00831446261815324
 LAYOUT_EDGE_OBJECTIVE_SCOPE = "all"
+KINETIC_COMMUNITY_AVAILABLE = Path(__file__).with_name("BVGraphKineticCommunities.py").exists()
+
+
+def _kinetic_community_module():
+    """Load the optional sibling module in script, package, or test contexts."""
+    module_name = "BVGraphKineticCommunities"
+    if not KINETIC_COMMUNITY_AVAILABLE:
+        raise RuntimeError(
+            "This BVGraph package does not include the optional kinetic-community module."
+        )
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    try:
+        from . import BVGraphKineticCommunities as module
+        return module
+    except (ImportError, ValueError):
+        import importlib.util
+
+        module_path = Path(__file__).with_name("BVGraphKineticCommunities.py")
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load optional kinetic-community module from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
 
 # ---------------------------
 # Utilities
@@ -143,6 +170,250 @@ def _optional_finite_float(value, label, row_number):
     return parsed
 
 
+def _favourability_percentiles(values, lower_is_better=True):
+    """Return deterministic mid-rank percentiles in [0, 1]."""
+    values = {key: float(value) for key, value in values.items()}
+    if not values:
+        return {}
+    ordered = sorted(values.items(), key=lambda item: (item[1], item[0]))
+    n = len(ordered)
+    if n == 1:
+        return {ordered[0][0]: 1.0}
+    result = {}
+    index = 0
+    while index < n:
+        end = index + 1
+        while end < n and math.isclose(
+            ordered[end][1], ordered[index][1], rel_tol=0.0, abs_tol=1e-12
+        ):
+            end += 1
+        mid_rank = 0.5 * (index + end - 1)
+        percentile = mid_rank / float(n - 1)
+        favourability = 1.0 - percentile if lower_is_better else percentile
+        for offset in range(index, end):
+            result[ordered[offset][0]] = float(favourability)
+        index = end
+    return result
+
+
+def _edge_key(u, v):
+    return (u, v) if u <= v else (v, u)
+
+
+def _mirror_node(G, node):
+    partner = _clean_id(G.nodes[node].get("Enantiomer_Id", ""))
+    return partner if partner in G else node
+
+
+def configure_energy_edge_weights(
+    G,
+    weighting_mode="none",
+    temperature_k=298.15,
+    floor_ratio=0.02,
+    transform="percentile",
+    percentile_power=2.0,
+    local_equilibrium_gate_floor=0.5,
+    mirror_energy_tolerance=1e-6,
+):
+    """Derive symmetry-consistent public layout weights from TS free energies."""
+    mode = str(weighting_mode).strip().lower()
+    if mode == "kinetic-community" and not KINETIC_COMMUNITY_AVAILABLE:
+        raise ValueError(
+            "This BVGraph package does not include the optional kinetic-community mode."
+        )
+    if mode not in {"none", "equilibrium-exchange", "reversible-local", "kinetic-community"}:
+        raise ValueError(
+            "edge_weighting must be 'none', 'equilibrium-exchange', "
+            "'reversible-local', or 'kinetic-community'."
+        )
+    transform = str(transform).strip().lower()
+    if transform not in {"percentile", "boltzmann"}:
+        raise ValueError("layout_weight_transform must be 'percentile' or 'boltzmann'.")
+    if transform == "boltzmann" and mode in {"reversible-local", "kinetic-community"}:
+        raise ValueError("The boltzmann layout transform is supported only for equilibrium-exchange mode.")
+    if not (0.0 < float(floor_ratio) <= 1.0):
+        raise ValueError("spring_weight_floor_ratio must be greater than 0 and no greater than 1.")
+    if not math.isfinite(float(percentile_power)) or float(percentile_power) <= 0.0:
+        raise ValueError("layout_weight_percentile_power must be a positive finite number.")
+    if not (0.0 <= float(local_equilibrium_gate_floor) <= 1.0):
+        raise ValueError("local_equilibrium_gate_floor must lie between 0 and 1.")
+
+    for u, v, data in G.edges(data=True):
+        data["Layout_Weighting_Mode"] = mode
+        data["Layout_Weight_Transform"] = "none" if mode == "none" else transform
+        data["Layout_Weight_Data_Available"] = False
+        data["Layout_Spring_Weight"] = 0.0 if u == v else 1.0
+        if u == v:
+            data["Weight_Data_Status"] = "self_loop"
+        elif data.get("Relative_TS_Energy") is not None:
+            data["Weight_Data_Status"] = "available_unweighted" if mode == "none" else "pending"
+        else:
+            data["Weight_Data_Status"] = "missing_ts_energy"
+
+    if mode == "none":
+        for u, v, data in G.edges(data=True):
+            if u != v and data.get("Relative_TS_Energy") is None:
+                data["Weight_Data_Status"] = "unweighted"
+        return {
+            "mode": mode,
+            "transform": "none",
+            "complete_edges": 0,
+            "unavailable_edges": sum(1 for u, v in G.edges() if u != v),
+            "orbit_warnings": 0,
+            "orbit_imputations": 0,
+        }
+
+    # Mirror-equivalent edges must use identical geometric evidence. Raw values
+    # stay on their original records; only Orbit_Relative_TS_Energy is shared.
+    orbits = defaultdict(list)
+    for u, v in G.edges():
+        if u == v:
+            continue
+        key = _edge_key(u, v)
+        mirror = _edge_key(_mirror_node(G, u), _mirror_node(G, v))
+        orbit = min(key, mirror)
+        orbits[orbit].append(key)
+    orbit_warnings = 0
+    orbit_imputations = 0
+    for orbit, members in orbits.items():
+        unique_members = sorted(set(members))
+        finite = [
+            float(G.edges[key]["Relative_TS_Energy"])
+            for key in unique_members
+            if G.edges[key].get("Relative_TS_Energy") is not None
+        ]
+        orbit_value = float(sum(finite) / len(finite)) if finite else None
+        if finite and max(finite) - min(finite) > float(mirror_energy_tolerance):
+            orbit_warnings += 1
+        partial = bool(finite) and len(finite) < len(unique_members)
+        for key in unique_members:
+            data = G.edges[key]
+            data["Mirror_Edge_Orbit"] = f"{orbit[0]}--{orbit[1]}"
+            if orbit_value is not None:
+                data["Orbit_Relative_TS_Energy"] = orbit_value
+            if partial and data.get("Relative_TS_Energy") is None:
+                data["Weight_Data_Status"] = "orbit_imputed_for_layout"
+                orbit_imputations += 1
+
+    energy_values = {
+        _edge_key(u, v): float(data["Orbit_Relative_TS_Energy"])
+        for u, v, data in G.edges(data=True)
+        if u != v and data.get("Orbit_Relative_TS_Energy") is not None
+    }
+    equilibrium_percentile = _favourability_percentiles(energy_values, lower_is_better=True)
+    reference_min = min(energy_values.values()) if energy_values else None
+    for key, value in energy_values.items():
+        data = G.edges[key]
+        data["Equilibrium_Favourability_Percentile"] = equilibrium_percentile[key]
+        exponent = -(value - reference_min) / (R_KJ_MOL_K * float(temperature_k))
+        data["Relative_Equilibrium_Conductance"] = float(math.exp(max(-745.0, exponent)))
+
+    layout_scores = {}
+    score_metric = "relative_ts_free_energy_kj_mol"
+    if mode in {"equilibrium-exchange", "kinetic-community"}:
+        layout_scores = dict(energy_values)
+    else:
+        # Stable local branching ratios: the common node-energy term cancels.
+        denominators = defaultdict(float)
+        edge_propensity = {}
+        for key, ts_energy in energy_values.items():
+            u, v = key
+            for node in (u, v):
+                incident = [
+                    float(G.edges[_edge_key(node, other)]["Orbit_Relative_TS_Energy"])
+                    for other in G[node]
+                    if other != node and G.edges[_edge_key(node, other)].get("Orbit_Relative_TS_Energy") is not None
+                ]
+                if not incident:
+                    continue
+                local_min = min(incident)
+                propensity = math.exp(
+                    max(-745.0, -(ts_energy - local_min) / (R_KJ_MOL_K * float(temperature_k)))
+                )
+                edge_propensity[(node, key)] = propensity
+        for (node, _), propensity in edge_propensity.items():
+            denominators[node] += propensity
+        for key in energy_values:
+            u, v = key
+            pu = edge_propensity.get((u, key), 0.0) / max(denominators.get(u, 0.0), 1e-300)
+            pv = edge_propensity.get((v, key), 0.0) / max(denominators.get(v, 0.0), 1e-300)
+            local = math.sqrt(max(0.0, pu * pv))
+            gate = float(local_equilibrium_gate_floor) + (
+                1.0 - float(local_equilibrium_gate_floor)
+            ) * equilibrium_percentile[key]
+            combined = local * gate
+            data = G.edges[key]
+            data["Forward_Local_Branching_Probability"] = float(pu)
+            data["Reverse_Local_Branching_Probability"] = float(pv)
+            data["Reversible_Local_Preference"] = float(local)
+            data["Equilibrium_Accessibility_Gate"] = float(gate)
+            data["Gated_Local_Preference"] = float(combined)
+            layout_scores[key] = float(combined)
+        score_metric = "gated_reversible_local_preference"
+
+    if mode in {"equilibrium-exchange", "kinetic-community"}:
+        layout_percentile = equilibrium_percentile
+    else:
+        layout_percentile = _favourability_percentiles(layout_scores, lower_is_better=False)
+
+    raw_weights = {}
+    for u, v, data in G.edges(data=True):
+        if u == v:
+            continue
+        key = _edge_key(u, v)
+        if key not in layout_scores:
+            raw_weights[key] = float(floor_ratio)
+            continue
+        q = float(layout_percentile[key])
+        if transform == "boltzmann":
+            salience = float(data["Relative_Equilibrium_Conductance"])
+        else:
+            salience = q ** float(percentile_power)
+        raw = float(floor_ratio) + (1.0 - float(floor_ratio)) * salience
+        raw_weights[key] = raw
+        data["Layout_Favourability_Percentile"] = q
+        data["Layout_Weight_Raw"] = raw
+        data["Layout_Weight_Input_Value"] = float(layout_scores[key])
+        data["Layout_Weight_Input_Metric"] = score_metric
+        data["Layout_Weight_Data_Available"] = True
+        if data.get("Weight_Data_Status") != "orbit_imputed_for_layout":
+            data["Weight_Data_Status"] = "complete"
+
+    raw_mean = sum(raw_weights.values()) / len(raw_weights) if raw_weights else 1.0
+    raw_mean = raw_mean if raw_mean > 0.0 else 1.0
+    for key, raw in raw_weights.items():
+        G.edges[key]["Layout_Spring_Weight"] = float(raw / raw_mean)
+
+    complete = sum(
+        1 for u, v, data in G.edges(data=True)
+        if u != v and data.get("Layout_Weight_Data_Available")
+    )
+    unavailable = sum(
+        1 for u, v, data in G.edges(data=True)
+        if u != v and not data.get("Layout_Weight_Data_Available")
+    )
+    if orbit_warnings:
+        print(
+            f"[WARN] {orbit_warnings} mirror edge orbit(s) contain TS energies differing by more than "
+            f"{mirror_energy_tolerance:g} kJ/mol; orbit means are used for layout only.",
+            flush=True,
+        )
+    if orbit_imputations:
+        print(
+            f"[WARN] {orbit_imputations} edge record(s) use a mirror-orbit TS value for layout because "
+            "their own TS value is missing.",
+            flush=True,
+        )
+    return {
+        "mode": mode,
+        "transform": transform,
+        "complete_edges": complete,
+        "unavailable_edges": unavailable,
+        "orbit_warnings": orbit_warnings,
+        "orbit_imputations": orbit_imputations,
+    }
+
+
 def read_graph(
     nodes_csv,
     edges_csv,
@@ -152,10 +423,11 @@ def read_graph(
     node_energy_column="Relative Energy (kJ/mol)",
     ts_energy_column="Relative TS Energy (kJ/mol)",
     temperature_k=298.15,
-    spring_weight_floor_ratio=0.05,
-    transient_flux_file=None,
-    transient_flux_metric="absolute-net",
-    transient_flux_column=None,
+    spring_weight_floor_ratio=0.02,
+    layout_weight_transform="percentile",
+    layout_weight_percentile_power=2.0,
+    local_equilibrium_gate_floor=0.5,
+    mirror_energy_tolerance=1e-6,
 ):
     # index_col=False keeps legacy CSVs with trailing empty fields from being
     # interpreted as a MultiIndex by newer pandas releases.  Reading every
@@ -164,21 +436,18 @@ def read_graph(
     edges = pd.read_csv(edges_csv, dtype=str, index_col=False)
     nodes[id_col] = nodes[id_col].astype(str).apply(_clean_id)
     weighting_mode = str(edge_weighting).strip().lower()
-    if weighting_mode not in {"none", "equilibrium-exchange", "transient-flux"}:
+    if weighting_mode == "kinetic-community" and not KINETIC_COMMUNITY_AVAILABLE:
         raise ValueError(
-            "edge_weighting must be 'none', 'equilibrium-exchange', or 'transient-flux'."
+            "This BVGraph package does not include the optional kinetic-community mode."
         )
+    if weighting_mode not in {"none", "equilibrium-exchange", "reversible-local", "kinetic-community"}:
+        raise ValueError("Unknown edge-weighting mode.")
     weighting_enabled = weighting_mode != "none"
     if temperature_k <= 0.0 or not math.isfinite(float(temperature_k)):
         raise ValueError("temperature_k must be a positive finite number.")
     floor_ratio = float(spring_weight_floor_ratio)
     if not math.isfinite(floor_ratio) or not (0.0 < floor_ratio <= 1.0):
         raise ValueError("spring_weight_floor_ratio must be greater than 0 and no greater than 1.")
-    transient_flux_metric = str(transient_flux_metric).strip().lower()
-    if transient_flux_metric not in {"absolute-net", "gross"}:
-        raise ValueError("transient_flux_metric must be 'absolute-net' or 'gross'.")
-    if weighting_mode == "transient-flux" and not transient_flux_file:
-        raise ValueError("--transient-flux-file is required for transient-flux weighting.")
 
     # normalize edge column names case-insensitively
     src_col = _find_column(edges, "source", aliases=("s",))
@@ -186,7 +455,7 @@ def read_graph(
     ts_col = _find_column(edges, ts_energy_column, aliases=("TS_Energy", "ts_energy", "ts"))
     if src_col is None or tgt_col is None:
         raise ValueError('Edges CSV must contain Source and Target columns (case-insensitive).')
-    if weighting_mode == "equilibrium-exchange" and ts_col is None:
+    if weighting_enabled and ts_col is None:
         raise ValueError(
             f"Edges CSV is missing transition-state energy column {ts_energy_column!r}. "
             "Use --ts-energy-column to select a different heading."
@@ -257,153 +526,45 @@ def read_graph(
         key = (s, t) if s <= t else (t, s)
         grouped_edges[key].append({"row": csv_row, "ts_energy": ts_energy})
 
-    pending_attrs = {}
     for (u, v), records in grouped_edges.items():
         finite_ts = [record["ts_energy"] for record in records if record["ts_energy"] is not None]
         selected_ts = min(finite_ts) if finite_ts else None
         attrs = {
-            "Layout_Spring_Weight": 0.0 if u == v else 1.0,
-            "Layout_Weighting_Mode": weighting_mode,
-            "Layout_Weight_Data_Available": False,
-            "Weight_Data_Status": "unweighted",
             "Input_Edge_Rows": int(len(records)),
+            # Preserve every finite parallel channel for the v1.2 reversible
+            # kinetic model. GEXF cannot serialize Python lists, so use JSON.
+            "Relative_TS_Energy_Channels_JSON": json.dumps(
+                [float(value) for value in finite_ts], separators=(",", ":")
+            ),
         }
         if selected_ts is not None:
             attrs["Relative_TS_Energy"] = float(selected_ts)
             attrs["TS_Energy"] = float(selected_ts)  # legacy export name
-        if u == v:
-            attrs["Weight_Data_Status"] = "self_loop"
-        elif weighting_mode == "equilibrium-exchange" and selected_ts is not None:
-            attrs["Layout_Weight_Data_Available"] = True
-            attrs["Weight_Data_Status"] = "complete"
-            attrs["Layout_Weight_Input_Value"] = float(selected_ts)
-            attrs["Layout_Weight_Input_Metric"] = "relative_ts_free_energy_kj_mol"
-        elif weighting_mode == "equilibrium-exchange":
-            attrs["Weight_Data_Status"] = "missing_ts_energy"
-        elif weighting_mode == "none" and selected_ts is not None:
-            attrs["Weight_Data_Status"] = "available_unweighted"
-        pending_attrs[(u, v)] = attrs
-
-    if weighting_mode == "transient-flux":
-        flux = pd.read_csv(transient_flux_file, dtype=str, index_col=False)
-        flux_src = _find_column(flux, "source", aliases=("s",))
-        flux_tgt = _find_column(flux, "target", aliases=("t",))
-        default_flux_column = (
-            "Integrated Absolute Net Flux" if transient_flux_metric == "absolute-net"
-            else "Integrated Gross Flux"
-        )
-        selected_flux_col = _find_column(flux, transient_flux_column or default_flux_column)
-        absolute_col = _find_column(flux, "Integrated Absolute Net Flux")
-        gross_col = _find_column(flux, "Integrated Gross Flux")
-        signed_col = _find_column(flux, "Integrated Signed Net Flux")
-        status_col = _find_column(flux, "Flux Data Status")
-        if flux_src is None or flux_tgt is None or selected_flux_col is None:
-            raise ValueError(
-                "Transient-flux CSV must contain source, target, and the selected flux column "
-                f"{transient_flux_column or default_flux_column!r}."
-            )
-        seen_flux_edges = set()
-        for row_index, row in flux.iterrows():
-            csv_row = int(row_index) + 2
-            s, t = _clean_id(row.get(flux_src)), _clean_id(row.get(flux_tgt))
-            key = (s, t) if s <= t else (t, s)
-            if s not in G or t not in G:
-                raise ValueError(
-                    f"Transient-flux CSV row {csv_row} references unknown node(s): {s!r}, {t!r}."
-                )
-            if key not in pending_attrs:
-                raise ValueError(
-                    f"Transient-flux CSV row {csv_row} references non-topology edge {s!r}-{t!r}."
-                )
-            if key in seen_flux_edges:
-                raise ValueError(
-                    f"Duplicate undirected transient-flux edge {key[0]!r}-{key[1]!r} at CSV row {csv_row}."
-                )
-            seen_flux_edges.add(key)
-            selected_flux = _optional_finite_float(row.get(selected_flux_col), selected_flux_col, csv_row)
-            if selected_flux is not None and selected_flux < 0.0:
-                raise ValueError(f"{selected_flux_col} at CSV row {csv_row} must be non-negative.")
-            status = _clean_id(row.get(status_col)) if status_col is not None else "complete"
-            status_lower = status.lower()
-            unavailable = any(token in status_lower for token in ("unavailable", "missing", "omitted"))
-            attrs = pending_attrs[key]
-            for column, name in (
-                (absolute_col, "Integrated_Absolute_Net_Flux"),
-                (gross_col, "Integrated_Gross_Flux"),
-                (signed_col, "Integrated_Signed_Net_Flux"),
-            ):
-                value = _optional_finite_float(row.get(column), column, csv_row) if column is not None else None
-                if (
-                    value is not None
-                    and name in {"Integrated_Absolute_Net_Flux", "Integrated_Gross_Flux"}
-                    and value < 0.0
-                ):
-                    raise ValueError(f"{column} at CSV row {csv_row} must be non-negative.")
-                if value is not None:
-                    attrs[name] = float(value)
-            if key[0] == key[1]:
-                attrs["Weight_Data_Status"] = "self_loop"
-            elif selected_flux is None or unavailable:
-                attrs["Weight_Data_Status"] = status or "unavailable_flux"
-            else:
-                attrs["Layout_Weight_Data_Available"] = True
-                attrs["Weight_Data_Status"] = status or "complete"
-                attrs["Layout_Weight_Input_Value"] = float(selected_flux)
-                attrs["Layout_Weight_Input_Metric"] = (
-                    "integrated_absolute_net_flux" if transient_flux_metric == "absolute-net"
-                    else "integrated_gross_flux"
-                )
-        for key, attrs in pending_attrs.items():
-            if key[0] != key[1] and key not in seen_flux_edges:
-                attrs["Weight_Data_Status"] = "missing_flux_row"
-
-    if weighting_enabled:
-        raw_weights = {}
-        available_values = [
-            float(attrs["Layout_Weight_Input_Value"])
-            for (u, v), attrs in pending_attrs.items()
-            if u != v and attrs.get("Layout_Weight_Data_Available")
-        ]
-        reference_min = min(available_values) if available_values else None
-        reference_max = max(available_values) if available_values else None
-        for (u, v), attrs in pending_attrs.items():
-            if u == v:
-                continue
-            value = attrs.get("Layout_Weight_Input_Value")
-            if value is None:
-                raw_weights[(u, v)] = floor_ratio
-            elif weighting_mode == "equilibrium-exchange":
-                exponent = -(float(value) - float(reference_min)) / (R_KJ_MOL_K * float(temperature_k))
-                raw_weights[(u, v)] = floor_ratio + (1.0 - floor_ratio) * math.exp(exponent)
-            elif reference_max is None or reference_max <= 0.0:
-                raw_weights[(u, v)] = floor_ratio
-            else:
-                raw_weights[(u, v)] = floor_ratio + (1.0 - floor_ratio) * float(value) / float(reference_max)
-        raw_mean = sum(raw_weights.values()) / len(raw_weights) if raw_weights else 1.0
-        if raw_mean <= 0.0:
-            raw_mean = 1.0
-        for key, raw_weight in raw_weights.items():
-            pending_attrs[key]["Layout_Spring_Weight"] = float(raw_weight / raw_mean)
-
-    for (u, v), attrs in pending_attrs.items():
         G.add_edge(u, v, **attrs)
 
+    # Annotation is needed here so mirror edge orbits can be formed before the
+    # main layout builds its representative graph. The main workflow repeats
+    # this idempotently for backward compatibility with callers.
+    G = attach_annotation_from_df(G, annotate_nodes(nodes, id_col=id_col), id_col=id_col)
+    weighting_summary = configure_energy_edge_weights(
+        G,
+        weighting_mode=weighting_mode,
+        temperature_k=temperature_k,
+        floor_ratio=floor_ratio,
+        transform=layout_weight_transform,
+        percentile_power=layout_weight_percentile_power,
+        local_equilibrium_gate_floor=local_equilibrium_gate_floor,
+        mirror_energy_tolerance=mirror_energy_tolerance,
+    )
+    duplicate_rows = sum(max(0, len(records) - 1) for records in grouped_edges.values())
     if weighting_enabled:
-        complete = sum(1 for u, v, d in G.edges(data=True) if u != v and d.get("Layout_Weight_Data_Available"))
-        unavailable = sum(1 for u, v, d in G.edges(data=True) if u != v and not d.get("Layout_Weight_Data_Available"))
-        self_loops = nx.number_of_selfloops(G)
-        duplicate_rows = sum(max(0, len(records) - 1) for records in grouped_edges.values())
         print(
-            f"[WEIGHTING] mode={weighting_mode} metric={transient_flux_metric if weighting_mode == 'transient-flux' else 'relative_ts_free_energy'} "
-            f"complete_edges={complete} unavailable_edges={unavailable} "
-            f"self_loops={self_loops} duplicate_rows={duplicate_rows} rejected_rows=0",
+            f"[WEIGHTING] mode={weighting_mode} transform={layout_weight_transform} "
+            f"complete_edges={weighting_summary['complete_edges']} "
+            f"unavailable_edges={weighting_summary['unavailable_edges']} "
+            f"self_loops={nx.number_of_selfloops(G)} duplicate_rows={duplicate_rows} rejected_rows=0",
             flush=True,
         )
-        if not available_values:
-            print(
-                "[WARN] No available non-self-loop weighting values were found; all non-self-loop spring weights normalise to 1.",
-                flush=True,
-            )
     elif skipped_unknown:
         print(f"[WARN] Skipped {skipped_unknown} edge row(s) that reference unknown nodes.", flush=True)
     return G, nodes, edges
@@ -534,6 +695,36 @@ def layout_reps_scale_aware(Grep, layout_scale=900.0, sweeps=4, seed=42):
         weight="Layout_Spring_Weight",
     )
     return {n: (float(x), float(y)) for n, (x, y) in pos.items()}
+
+
+def build_kinetic_community_model(
+    G, pairs, node2pair, temperature_k=298.15, min_sep=60.0,
+    community_selection="auto", community_count=0, community_max_count=20,
+    membership_mode="soft", packing_region_max_nodes=150,
+    landmark_count=0, seed=42,
+):
+    """Build the v1.2 full-state reversible kinetic-community model."""
+    return _kinetic_community_module().build_model(
+        G, pairs, node2pair,
+        temperature_k=temperature_k,
+        min_sep=min_sep,
+        community_selection=community_selection,
+        community_count=community_count,
+        community_max_count=community_max_count,
+        membership_mode=membership_mode,
+        packing_region_max_nodes=packing_region_max_nodes,
+        landmark_count=landmark_count,
+        seed=seed,
+    )
+
+
+def apply_kinetic_initialization(Grep, reps_pos, rep_of, model, layout_scale, seed=42):
+    """Apply the symmetry-aware packed v1.2 initialization."""
+    return _kinetic_community_module().representative_initial_positions(
+        Grep, reps_pos, rep_of, model, layout_scale, seed=seed
+    )
+
+
 # ---------------------------
 # Mirror enforcement and initial positions
 # ---------------------------
@@ -2683,6 +2874,13 @@ def write_gexf_with_viz(G, pos, out_path):
         f.write('      <attribute id="4" title="Relative_Energy" type="float"/>\n')
         f.write('      <attribute id="5" title="Central_Layout_Target" type="boolean"/>\n')
         f.write('      <attribute id="6" title="Hemisphere_Optimization" type="string"/>\n')
+        if KINETIC_COMMUNITY_AVAILABLE:
+            f.write('      <attribute id="7" title="Kinetic_Community_Covered" type="boolean"/>\n')
+            f.write('      <attribute id="8" title="Kinetic_Community" type="integer"/>\n')
+            f.write('      <attribute id="9" title="Kinetic_Community_Status" type="string"/>\n')
+            f.write('      <attribute id="33" title="Kinetic_Community_Confidence" type="float"/>\n')
+            f.write('      <attribute id="34" title="Kinetic_Packing_Region" type="integer"/>\n')
+            f.write('      <attribute id="35" title="Kinetic_Community_Membership_JSON" type="string"/>\n')
         f.write('    </attributes>\n')
         f.write('    <attributes class="edge">\n')
         f.write('      <attribute id="10" title="TS_Energy" type="float"/>\n')
@@ -2694,11 +2892,24 @@ def write_gexf_with_viz(G, pos, out_path):
         f.write('      <attribute id="16" title="Layout_Weight_Input_Metric" type="string"/>\n')
         f.write('      <attribute id="17" title="Layout_Weight_Input_Value" type="float"/>\n')
         f.write('      <attribute id="18" title="Layout_Weight_Data_Available" type="boolean"/>\n')
-        f.write('      <attribute id="19" title="Integrated_Absolute_Net_Flux" type="float"/>\n')
-        f.write('      <attribute id="20" title="Integrated_Gross_Flux" type="float"/>\n')
-        f.write('      <attribute id="21" title="Integrated_Signed_Net_Flux" type="float"/>\n')
+        f.write('      <attribute id="19" title="Orbit_Relative_TS_Energy" type="float"/>\n')
+        f.write('      <attribute id="20" title="Relative_Equilibrium_Conductance" type="float"/>\n')
+        f.write('      <attribute id="21" title="Layout_Favourability_Percentile" type="float"/>\n')
         f.write('      <attribute id="22" title="Cross_Axis_At_Final" type="boolean"/>\n')
         f.write('      <attribute id="23" title="Hemisphere_Optimization" type="string"/>\n')
+        f.write('      <attribute id="24" title="Layout_Weight_Transform" type="string"/>\n')
+        f.write('      <attribute id="25" title="Layout_Weight_Raw" type="float"/>\n')
+        f.write('      <attribute id="26" title="Equilibrium_Favourability_Percentile" type="float"/>\n')
+        f.write('      <attribute id="27" title="Forward_Local_Branching_Probability" type="float"/>\n')
+        f.write('      <attribute id="28" title="Reverse_Local_Branching_Probability" type="float"/>\n')
+        f.write('      <attribute id="29" title="Reversible_Local_Preference" type="float"/>\n')
+        f.write('      <attribute id="30" title="Equilibrium_Accessibility_Gate" type="float"/>\n')
+        f.write('      <attribute id="31" title="Gated_Local_Preference" type="float"/>\n')
+        f.write('      <attribute id="32" title="Mirror_Edge_Orbit" type="string"/>\n')
+        if KINETIC_COMMUNITY_AVAILABLE:
+            f.write('      <attribute id="36" title="Kinetic_Equilibrium_Conductance_Scaled" type="float"/>\n')
+            f.write('      <attribute id="37" title="Kinetic_Data_Status" type="string"/>\n')
+            f.write('      <attribute id="38" title="Relative_TS_Energy_Channels_JSON" type="string"/>\n')
         f.write('    </attributes>\n')
         f.write('    <nodes>\n')
         for n, data in G.nodes(data=True):
@@ -2713,6 +2924,13 @@ def write_gexf_with_viz(G, pos, out_path):
                 f.write(f'          <attvalue for="4" value="{float(data["Relative_Energy"])}"/>\n')
             f.write(f'          <attvalue for="5" value="{str(bool(data.get("Central_Layout_Target", False))).lower()}"/>\n')
             f.write(f'          <attvalue for="6" value="{data.get("Hemisphere_Optimization", "local")}"/>\n')
+            if KINETIC_COMMUNITY_AVAILABLE:
+                f.write(f'          <attvalue for="7" value="{str(bool(data.get("Kinetic_Community_Covered", False))).lower()}"/>\n')
+                f.write(f'          <attvalue for="8" value="{int(data.get("Kinetic_Community", -1))}"/>\n')
+                f.write(f'          <attvalue for="9" value="{saxutils.escape(str(data.get("Kinetic_Community_Status", "")))}"/>\n')
+                f.write(f'          <attvalue for="33" value="{float(data.get("Kinetic_Community_Confidence", 0.0))}"/>\n')
+                f.write(f'          <attvalue for="34" value="{int(data.get("Kinetic_Packing_Region", -1))}"/>\n')
+                f.write(f'          <attvalue for="35" value="{saxutils.escape(str(data.get("Kinetic_Community_Membership_JSON", "[]")))}"/>\n')
             f.write('        </attvalues>\n')
             f.write(f'        <viz:position x="{x}" y="{y}" z="0"/>\n')
             f.write('      </node>\n')
@@ -2735,11 +2953,22 @@ def write_gexf_with_viz(G, pos, out_path):
             if "Layout_Weight_Input_Value" in data:
                 f.write(f'          <attvalue for="17" value="{float(data["Layout_Weight_Input_Value"])}"/>\n')
             f.write(f'          <attvalue for="18" value="{str(bool(data.get("Layout_Weight_Data_Available", False))).lower()}"/>\n')
-            for attr_id, attr_name in (("19", "Integrated_Absolute_Net_Flux"), ("20", "Integrated_Gross_Flux"), ("21", "Integrated_Signed_Net_Flux")):
+            for attr_id, attr_name in (("19", "Orbit_Relative_TS_Energy"), ("20", "Relative_Equilibrium_Conductance"), ("21", "Layout_Favourability_Percentile")):
                 if attr_name in data:
                     f.write(f'          <attvalue for="{attr_id}" value="{float(data[attr_name])}"/>\n')
             f.write(f'          <attvalue for="22" value="{str(bool(data.get("Cross_Axis_At_Final", False))).lower()}"/>\n')
             f.write(f'          <attvalue for="23" value="{data.get("Hemisphere_Optimization", "local")}"/>\n')
+            f.write(f'          <attvalue for="24" value="{data.get("Layout_Weight_Transform", "none")}"/>\n')
+            for attr_id, attr_name in (("25", "Layout_Weight_Raw"), ("26", "Equilibrium_Favourability_Percentile"), ("27", "Forward_Local_Branching_Probability"), ("28", "Reverse_Local_Branching_Probability"), ("29", "Reversible_Local_Preference"), ("30", "Equilibrium_Accessibility_Gate"), ("31", "Gated_Local_Preference")):
+                if attr_name in data:
+                    f.write(f'          <attvalue for="{attr_id}" value="{float(data[attr_name])}"/>\n')
+            if data.get("Mirror_Edge_Orbit"):
+                f.write(f'          <attvalue for="32" value="{data["Mirror_Edge_Orbit"]}"/>\n')
+            if KINETIC_COMMUNITY_AVAILABLE:
+                if "Kinetic_Equilibrium_Conductance_Scaled" in data:
+                    f.write(f'          <attvalue for="36" value="{float(data["Kinetic_Equilibrium_Conductance_Scaled"])}"/>\n')
+                f.write(f'          <attvalue for="37" value="{data.get("Kinetic_Data_Status", "not_applicable")}"/>\n')
+                f.write(f'          <attvalue for="38" value="{saxutils.escape(str(data.get("Relative_TS_Energy_Channels_JSON", "[]")))}"/>\n')
             f.write('        </attvalues>\n')
             f.write('      </edge>\n')
             i += 1
@@ -2916,6 +3145,13 @@ def write_xgmml_with_viz(G, pos, out_path, graph_label="BVGraph"):
             if "Relative_Energy" in data:
                 f.write(attr_xml("Relative_Energy", float(data["Relative_Energy"]), "real"))
             f.write(attr_xml("Central_Layout_Target", bool(data.get("Central_Layout_Target", False)), "boolean"))
+            if KINETIC_COMMUNITY_AVAILABLE:
+                f.write(attr_xml("Kinetic_Community_Covered", bool(data.get("Kinetic_Community_Covered", False)), "boolean"))
+                f.write(attr_xml("Kinetic_Community", int(data.get("Kinetic_Community", -1)), "integer"))
+                f.write(attr_xml("Kinetic_Community_Status", data.get("Kinetic_Community_Status", ""), "string"))
+                f.write(attr_xml("Kinetic_Community_Confidence", float(data.get("Kinetic_Community_Confidence", 0.0)), "real"))
+                f.write(attr_xml("Kinetic_Packing_Region", int(data.get("Kinetic_Packing_Region", -1)), "integer"))
+                f.write(attr_xml("Kinetic_Community_Membership_JSON", data.get("Kinetic_Community_Membership_JSON", "[]"), "string"))
             f.write(attr_xml("Hemisphere_Optimization", data.get("Hemisphere_Optimization", "local"), "string"))
             # add graphics element with coordinates
             f.write(f'    <graphics x="{float(x)}" y="{float(y)}"/>\n')
@@ -2936,13 +3172,26 @@ def write_xgmml_with_viz(G, pos, out_path, graph_label="BVGraph"):
             if "Layout_Weight_Input_Value" in data:
                 f.write(attr_xml("Layout_Weight_Input_Value", float(data["Layout_Weight_Input_Value"]), "real"))
             f.write(attr_xml("Layout_Weight_Data_Available", bool(data.get("Layout_Weight_Data_Available", False)), "boolean"))
-            for attr_name in ("Integrated_Absolute_Net_Flux", "Integrated_Gross_Flux", "Integrated_Signed_Net_Flux"):
+            for attr_name in (
+                "Orbit_Relative_TS_Energy", "Relative_Equilibrium_Conductance",
+                "Layout_Favourability_Percentile", "Layout_Weight_Raw",
+                "Equilibrium_Favourability_Percentile", "Forward_Local_Branching_Probability",
+                "Reverse_Local_Branching_Probability", "Reversible_Local_Preference",
+                "Equilibrium_Accessibility_Gate", "Gated_Local_Preference",
+            ):
                 if attr_name in data:
                     f.write(attr_xml(attr_name, float(data[attr_name]), "real"))
+            f.write(attr_xml("Layout_Weight_Transform", data.get("Layout_Weight_Transform", "none"), "string"))
+            f.write(attr_xml("Mirror_Edge_Orbit", data.get("Mirror_Edge_Orbit", ""), "string"))
             f.write(attr_xml("Layout_Spring_Weight", float(data.get("Layout_Spring_Weight", 1.0)), "real"))
             f.write(attr_xml("Input_Edge_Rows", int(data.get("Input_Edge_Rows", 1)), "integer"))
             f.write(attr_xml("Cross_Axis_At_Final", bool(data.get("Cross_Axis_At_Final", False)), "boolean"))
             f.write(attr_xml("Hemisphere_Optimization", data.get("Hemisphere_Optimization", "local"), "string"))
+            if KINETIC_COMMUNITY_AVAILABLE:
+                if "Kinetic_Equilibrium_Conductance_Scaled" in data:
+                    f.write(attr_xml("Kinetic_Equilibrium_Conductance_Scaled", float(data["Kinetic_Equilibrium_Conductance_Scaled"]), "real"))
+                f.write(attr_xml("Kinetic_Data_Status", data.get("Kinetic_Data_Status", "not_applicable"), "string"))
+                f.write(attr_xml("Relative_TS_Energy_Channels_JSON", data.get("Relative_TS_Energy_Channels_JSON", "[]"), "string"))
             f.write('  </edge>\n')
             edge_id += 1
         f.write('</graph>\n')
@@ -2955,7 +3204,7 @@ def write_nodes_coords_csv(G, pos, out_path, id_col="id"):
     rows = []
     for n, data in G.nodes(data=True):
         x, y = pos.get(n, (0.0, 0.0))
-        rows.append({
+        row = {
             id_col: n,
             "x": float(x),
             "y": float(y),
@@ -2968,7 +3217,17 @@ def write_nodes_coords_csv(G, pos, out_path, id_col="id"):
             "Enantiomer_Id": data.get("Enantiomer_Id", ""),
             "Central Layout Target": bool(data.get("Central_Layout_Target", False)),
             "Hemisphere Optimization": data.get("Hemisphere_Optimization", "local"),
-        })
+        }
+        if KINETIC_COMMUNITY_AVAILABLE:
+            row.update({
+                "Kinetic Community Covered": bool(data.get("Kinetic_Community_Covered", False)),
+                "Kinetic Community": int(data.get("Kinetic_Community", -1)),
+                "Kinetic Community Status": data.get("Kinetic_Community_Status", ""),
+                "Kinetic Community Confidence": float(data.get("Kinetic_Community_Confidence", 0.0)),
+                "Kinetic Packing Region": int(data.get("Kinetic_Packing_Region", -1)),
+                "Kinetic Community Membership JSON": data.get("Kinetic_Community_Membership_JSON", "[]"),
+            })
+        rows.append(row)
     df = _pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
 
@@ -2979,24 +3238,40 @@ def write_edges_csv(G, out_path):
     import pandas as _pd
     rows = []
     for u, v, data in G.edges(data=True):
-        rows.append({
+        row = {
             "Source": u,
             "Target": v,
             "TS_Energy": data.get("TS_Energy", ""),
             "Relative TS Energy (kJ/mol)": data.get("Relative_TS_Energy", ""),
+            "Orbit Relative TS Energy (kJ/mol)": data.get("Orbit_Relative_TS_Energy", ""),
+            "Mirror Edge Orbit": data.get("Mirror_Edge_Orbit", ""),
             "Weight Data Status": data.get("Weight_Data_Status", "unweighted"),
             "Layout Weighting Mode": data.get("Layout_Weighting_Mode", "none"),
+            "Layout Weight Transform": data.get("Layout_Weight_Transform", "none"),
             "Layout Weight Input Metric": data.get("Layout_Weight_Input_Metric", ""),
             "Layout Weight Input Value": data.get("Layout_Weight_Input_Value", ""),
             "Layout Weight Data Available": bool(data.get("Layout_Weight_Data_Available", False)),
-            "Integrated Absolute Net Flux": data.get("Integrated_Absolute_Net_Flux", ""),
-            "Integrated Gross Flux": data.get("Integrated_Gross_Flux", ""),
-            "Integrated Signed Net Flux": data.get("Integrated_Signed_Net_Flux", ""),
+            "Relative Equilibrium Conductance": data.get("Relative_Equilibrium_Conductance", ""),
+            "Equilibrium Favourability Percentile": data.get("Equilibrium_Favourability_Percentile", ""),
+            "Forward Local Branching Probability": data.get("Forward_Local_Branching_Probability", ""),
+            "Reverse Local Branching Probability": data.get("Reverse_Local_Branching_Probability", ""),
+            "Reversible Local Preference": data.get("Reversible_Local_Preference", ""),
+            "Equilibrium Accessibility Gate": data.get("Equilibrium_Accessibility_Gate", ""),
+            "Gated Local Preference": data.get("Gated_Local_Preference", ""),
+            "Layout Favourability Percentile": data.get("Layout_Favourability_Percentile", ""),
+            "Layout Weight Raw": data.get("Layout_Weight_Raw", ""),
             "Layout Spring Weight": float(data.get("Layout_Spring_Weight", 1.0)),
             "Input Edge Rows": int(data.get("Input_Edge_Rows", 1)),
             "Cross Axis At Final": bool(data.get("Cross_Axis_At_Final", False)),
             "Hemisphere Optimization": data.get("Hemisphere_Optimization", "local"),
-        })
+        }
+        if KINETIC_COMMUNITY_AVAILABLE:
+            row.update({
+                "Kinetic Equilibrium Conductance Scaled": data.get("Kinetic_Equilibrium_Conductance_Scaled", ""),
+                "Kinetic Data Status": data.get("Kinetic_Data_Status", "not_applicable"),
+                "Relative TS Energy Channels JSON": data.get("Relative_TS_Energy_Channels_JSON", "[]"),
+            })
+        rows.append(row)
     df = _pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
 
@@ -3042,10 +3317,18 @@ def main():
                     help="Optional fixed soft-spacing reference for initial_normalized mode (use when continuing a prior run).")
     ap.add_argument("--objective-reference-center-penalty", type=float, default=None,
                     help="Optional fixed central-isomer reference penalty for initial_normalized resume runs.")
+    if KINETIC_COMMUNITY_AVAILABLE:
+        ap.add_argument("--objective-reference-community-stress", type=float, default=None,
+                        help="Optional fixed kinetic-community stress reference for resume runs.")
+        ap.add_argument("--objective-reference-community-packing", type=float, default=None,
+                        help="Optional fixed temporary packing reference for kinetic-community resume runs.")
     ap.add_argument("--objective-crossing-weight", type=float, default=0.20,
                     help="Crossing importance; in initial_normalized mode this is the requested normalized coefficient.")
     ap.add_argument("--objective-edge-length-weight", type=float, default=1.00,
                     help="Energy-weighted edge-length importance; normalized to the starting value when requested.")
+    if KINETIC_COMMUNITY_AVAILABLE:
+        ap.add_argument("--objective-community-weight", type=float, default=0.0,
+                        help="Kinetic diffusion-distance stress importance; active only in kinetic-community mode.")
     ap.add_argument(
         "--edge-objective-scope",
         choices=["all", "weighted-data"],
@@ -3201,11 +3484,17 @@ def main():
     ap.add_argument("--out-xgmml", default=None, help="Optional output XGMML file path (Cytoscape).")
     ap.add_argument("--out-nodes-csv", default=None, help="Optional output CSV with node coords & barcodes.")
     ap.add_argument("--out-edges-csv", default=None, help="Optional output CSV with edge data.")
+    weighting_choices = ["none", "equilibrium-exchange", "reversible-local"]
+    if KINETIC_COMMUNITY_AVAILABLE:
+        weighting_choices.append("kinetic-community")
     ap.add_argument(
         "--edge-weighting",
-        choices=["none", "equilibrium-exchange", "transient-flux"],
+        choices=weighting_choices,
         default="none",
-        help="Select uniform, absolute-TS equilibrium-exchange, or externally supplied transient-flux attraction.",
+        help=(
+            "Select uniform, equilibrium-exchange, or reversible-local layout treatment"
+            + (", with kinetic-community available in this package." if KINETIC_COMMUNITY_AVAILABLE else ".")
+        ),
     )
     ap.add_argument(
         "--node-energy-column",
@@ -3217,32 +3506,74 @@ def main():
         default="Relative TS Energy (kJ/mol)",
         help="Edges CSV column containing TS energies relative to the lowest-energy ground-state node.",
     )
-    ap.add_argument("--temperature-k", type=float, default=298.15, help="Temperature in kelvin for equilibrium-exchange weighting.")
+    ap.add_argument("--temperature-k", type=float, default=298.15, help="Temperature in kelvin for kinetic weighting.")
     ap.add_argument(
         "--spring-weight-floor-ratio",
         type=float,
-        default=0.05,
+        default=0.02,
         help="Minimum raw attraction relative to the strongest weighted edge (0 < value <= 1).",
     )
     ap.add_argument(
-        "--transient-flux-file",
-        default=None,
-        help="Edge CSV containing integrated transient-flux metrics; required in transient-flux mode.",
+        "--layout-weight-transform",
+        choices=["percentile", "boltzmann"],
+        default="percentile",
+        help="Map physical energetic evidence to graphical weights; percentile is transferable between networks.",
     )
-    ap.add_argument(
-        "--transient-flux-metric",
-        choices=["absolute-net", "gross"],
-        default="absolute-net",
-        help="Transient metric used for layout attraction (default: absolute-net).",
-    )
-    ap.add_argument(
-        "--transient-flux-column",
-        default=None,
-        help="Optional override for the selected transient-flux CSV value column.",
-    )
+    ap.add_argument("--layout-weight-percentile-power", type=float, default=2.0,
+                    help="Power applied to favourability percentiles (default 2.0).")
+    ap.add_argument("--local-equilibrium-gate-floor", type=float, default=0.5,
+                    help="Minimum equilibrium-accessibility multiplier in reversible-local mode.")
+    ap.add_argument("--mirror-energy-tolerance", type=float, default=1e-6,
+                    help="Warning tolerance for mirror-orbit TS discrepancies in kJ/mol.")
+    if KINETIC_COMMUNITY_AVAILABLE:
+        ap.add_argument("--community-selection", choices=["auto", "fixed"], default="auto",
+                        help="Select the kinetic macro-community count automatically or request a fixed count.")
+        ap.add_argument("--community-count", type=int, default=0,
+                        help="Macro-community count required when --community-selection fixed is used.")
+        ap.add_argument("--community-max-count", type=int, default=20,
+                        help="Largest macro-community count considered by automatic selection.")
+        ap.add_argument("--community-membership", choices=["soft", "hard"], default="soft",
+                        help="Use soft PCCA+-style memberships or hard maximum-membership assignments.")
+        ap.add_argument("--packing-region-max-nodes", type=int, default=150,
+                        help="Maximum displayed nodes in a connected temporary packing region.")
+        ap.add_argument("--community-packing-weight", type=float, default=0.10,
+                        help="Initial normalized temporary packing coefficient in kinetic-community mode.")
+        ap.add_argument("--community-packing-anneal-cycles", type=int, default=200,
+                        help="Valid cycles over which the temporary packing coefficient falls linearly to zero.")
+        ap.add_argument("--community-landmarks", type=int, default=0,
+                        help="Kinetic stress landmarks; 0 chooses clamp(ceil(sqrt(N)), 32, 256).")
+        ap.add_argument("--kinetic-community-relax-iters", type=int, default=5,
+                        help="Mirror-preserving kinetic-stress relaxation proposals per active cycle.")
+        ap.add_argument("--out-community-json", default=None,
+                        help="Optional JSON report for kinetic modes, selection and packing diagnostics.")
+        ap.add_argument("--out-community-csv", default=None,
+                        help="Optional per-node community membership and packing-region CSV.")
+        ap.add_argument("--community-analysis-only", action="store_true",
+                        help="Build and export the kinetic-community analysis without optimizing coordinates.")
     args = ap.parse_args()
+    if not KINETIC_COMMUNITY_AVAILABLE:
+        community_defaults = {
+            "objective_reference_community_stress": None,
+            "objective_reference_community_packing": None,
+            "objective_community_weight": 0.0,
+            "community_selection": "auto",
+            "community_count": 0,
+            "community_max_count": 20,
+            "community_membership": "soft",
+            "packing_region_max_nodes": 150,
+            "community_packing_weight": 0.0,
+            "community_packing_anneal_cycles": 0,
+            "community_landmarks": 0,
+            "kinetic_community_relax_iters": 0,
+            "out_community_json": None,
+            "out_community_csv": None,
+            "community_analysis_only": False,
+        }
+        for name, value in community_defaults.items():
+            setattr(args, name, value)
 
     global LAYOUT_EDGE_OBJECTIVE_SCOPE, LAYOUT_EDGE_LENGTH_POWER, LAYOUT_CENTER_TARGETS
+    global LAYOUT_COMMUNITY_MODEL, LAYOUT_COMMUNITY_PACKING_WEIGHT
     LAYOUT_EDGE_OBJECTIVE_SCOPE = args.edge_objective_scope
     verbose = args.verbose
     args.center_isomer = _clean_id(args.center_isomer) if args.center_isomer is not None else None
@@ -3267,6 +3598,28 @@ def main():
         raise ValueError("--cycle-offset must be non-negative.")
     if args.max_runtime_hours < 0.0 or not math.isfinite(float(args.max_runtime_hours)):
         raise ValueError("--max-runtime-hours must be zero or a positive finite number.")
+    if args.objective_community_weight < 0.0 or not math.isfinite(float(args.objective_community_weight)):
+        raise ValueError("--objective-community-weight must be zero or a positive finite number.")
+    if args.edge_weighting != "kinetic-community" and args.objective_community_weight > 0.0:
+        raise ValueError("--objective-community-weight requires --edge-weighting kinetic-community.")
+    if args.edge_weighting != "kinetic-community" and args.community_packing_weight > 0.0:
+        # The public default is harmless for other modes; only explicit non-default
+        # use is meaningful, so leave it dormant rather than changing old commands.
+        pass
+    if args.community_selection == "fixed" and args.community_count < 2:
+        raise ValueError("--community-selection fixed requires --community-count of at least 2.")
+    if args.community_max_count < 2:
+        raise ValueError("--community-max-count must be at least 2.")
+    if args.packing_region_max_nodes < 2:
+        raise ValueError("--packing-region-max-nodes must be at least 2.")
+    if args.community_packing_weight < 0.0 or not math.isfinite(float(args.community_packing_weight)):
+        raise ValueError("--community-packing-weight must be zero or a positive finite number.")
+    if args.community_packing_anneal_cycles < 0:
+        raise ValueError("--community-packing-anneal-cycles must be non-negative.")
+    if args.community_landmarks < 0:
+        raise ValueError("--community-landmarks must be non-negative.")
+    if args.community_analysis_only and args.edge_weighting != "kinetic-community":
+        raise ValueError("--community-analysis-only requires --edge-weighting kinetic-community.")
     if args.separation_project_every <= 0 or args.separation_project_iters <= 0:
         raise ValueError("Progressive separation cadence and iteration counts must be positive.")
     separation_levels = parse_separation_levels(args.separation_levels, args.min_sep)
@@ -3274,12 +3627,36 @@ def main():
     if args.resume_state_json:
         resume_state = json.loads(Path(args.resume_state_json).read_text(encoding="utf-8"))
         saved_parameters = resume_state.get("parameters", {})
+        if (
+            args.edge_weighting == "kinetic-community"
+            and saved_parameters.get("community_model_version") != 2
+        ):
+            raise ValueError(
+                "This kinetic-community checkpoint uses the superseded model and cannot be resumed "
+                "with BVGraph v1.2.0. Start a fresh kinetic-community layout."
+            )
         resume_compatibility = {
             "hemisphere_optimization": args.hemisphere_optimization,
             "hemi_span_adjustment": args.hemi_span_adjustment,
             "center_isomer": args.center_isomer,
             "center_weight": float(args.center_weight),
             "edge_weighting": args.edge_weighting,
+            "layout_weight_transform": args.layout_weight_transform,
+            "layout_weight_percentile_power": float(args.layout_weight_percentile_power),
+            "spring_weight_floor_ratio": float(args.spring_weight_floor_ratio),
+            "mirror_energy_tolerance": float(args.mirror_energy_tolerance),
+            "objective_community_weight": float(args.objective_community_weight),
+            "local_equilibrium_gate_floor": float(args.local_equilibrium_gate_floor),
+            "community_model_version": 2,
+            "community_selection": args.community_selection,
+            "community_count": int(args.community_count),
+            "community_max_count": int(args.community_max_count),
+            "community_membership": args.community_membership,
+            "packing_region_max_nodes": int(args.packing_region_max_nodes),
+            "community_packing_weight": float(args.community_packing_weight),
+            "community_packing_anneal_cycles": int(args.community_packing_anneal_cycles),
+            "community_landmarks": int(args.community_landmarks),
+            "kinetic_community_relax_iters": int(args.kinetic_community_relax_iters),
             "edge_length_power": float(args.edge_length_power),
             "cross_axis_edge_weight": float(args.cross_axis_edge_weight),
             "edge_objective_scope": args.edge_objective_scope,
@@ -3316,6 +3693,10 @@ def main():
             args.objective_reference_spacing_penalty = objective_state.get("initial_spacing_penalty")
         if args.objective_reference_center_penalty is None:
             args.objective_reference_center_penalty = objective_state.get("initial_center_penalty")
+        if args.objective_reference_community_stress is None:
+            args.objective_reference_community_stress = objective_state.get("initial_community_stress")
+        if args.objective_reference_community_packing is None:
+            args.objective_reference_community_packing = objective_state.get("initial_community_packing")
     if args.checkpoint_gephi and args.checkpoint_state_json is None:
         args.checkpoint_state_json = str(Path(args.checkpoint_gephi).with_name(Path(args.checkpoint_gephi).name + ".state.json"))
     if args.checkpoint_gephi and args.best_checkpoint_gephi is None:
@@ -3342,9 +3723,10 @@ def main():
         ts_energy_column=args.ts_energy_column,
         temperature_k=args.temperature_k,
         spring_weight_floor_ratio=args.spring_weight_floor_ratio,
-        transient_flux_file=args.transient_flux_file,
-        transient_flux_metric=args.transient_flux_metric,
-        transient_flux_column=args.transient_flux_column,
+        layout_weight_transform=args.layout_weight_transform,
+        layout_weight_percentile_power=args.layout_weight_percentile_power,
+        local_equilibrium_gate_floor=args.local_equilibrium_gate_floor,
+        mirror_energy_tolerance=args.mirror_energy_tolerance,
     )
     print(f"[INFO] Nodes={G.number_of_nodes()} Edges={G.number_of_edges()}", flush=True)
 
@@ -3371,6 +3753,69 @@ def main():
             f"[CENTER] requested={args.center_isomer} targets={list(center_targets)} weight={args.center_weight}",
             flush=True,
         )
+
+    LAYOUT_COMMUNITY_MODEL = None
+    if args.edge_weighting == "kinetic-community":
+        print("[START] Building reversible kinetic-community model", flush=True)
+        LAYOUT_COMMUNITY_MODEL = build_kinetic_community_model(
+            G,
+            pairs,
+            node2pair,
+            temperature_k=args.temperature_k,
+            min_sep=args.min_sep,
+            community_selection=args.community_selection,
+            community_count=args.community_count,
+            community_max_count=args.community_max_count,
+            membership_mode=args.community_membership,
+            packing_region_max_nodes=args.packing_region_max_nodes,
+            landmark_count=args.community_landmarks,
+            seed=args.seed,
+        )
+        _kinetic_community_module().annotate_graph(G, LAYOUT_COMMUNITY_MODEL)
+        print(
+            "[KINETIC COMMUNITY] "
+            f"finite_nodes={LAYOUT_COMMUNITY_MODEL['finite_nodes']}/{LAYOUT_COMMUNITY_MODEL['total_nodes']} "
+            f"finite_representatives={LAYOUT_COMMUNITY_MODEL['finite_representatives']}/"
+            f"{LAYOUT_COMMUNITY_MODEL['total_representatives']} "
+            f"retained_modes={LAYOUT_COMMUNITY_MODEL['retained_modes']} "
+            f"landmarks={len(LAYOUT_COMMUNITY_MODEL['landmarks'])}",
+            flush=True,
+        )
+        covered = set(LAYOUT_COMMUNITY_MODEL["nodes"])
+        for node in G:
+            G.nodes[node]["Kinetic_Community_Covered"] = bool(node in covered)
+        if args.out_community_json:
+            community_path = Path(args.out_community_json)
+            community_path.parent.mkdir(parents=True, exist_ok=True)
+            community_path.write_text(
+                json.dumps(LAYOUT_COMMUNITY_MODEL["report"], indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            print(f"[OK] Wrote community report JSON -> {community_path}", flush=True)
+        if args.out_community_csv:
+            rows = []
+            for node in sorted(G):
+                memberships = LAYOUT_COMMUNITY_MODEL["memberships"].get(node, [])
+                rows.append({
+                    "id": node,
+                    "Kinetic Community": LAYOUT_COMMUNITY_MODEL["hard_community"].get(node, -1),
+                    "Membership Confidence": max(memberships) if memberships else 0.0,
+                    "Membership JSON": json.dumps(memberships, separators=(",", ":")),
+                    "Packing Region": LAYOUT_COMMUNITY_MODEL["region_by_node"].get(node, -1),
+                    "Community Data Status": LAYOUT_COMMUNITY_MODEL["node_status"].get(
+                        node, "unclassified_missing_energy"
+                    ),
+                })
+            community_csv_path = Path(args.out_community_csv)
+            community_csv_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(rows).to_csv(community_csv_path, index=False)
+            print(f"[OK] Wrote community membership CSV -> {community_csv_path}", flush=True)
+        if args.community_analysis_only:
+            print("[OK] Kinetic-community analysis-only run complete.", flush=True)
+            return
+    else:
+        for node in G:
+            G.nodes[node]["Kinetic_Community_Covered"] = False
 
     if len(pairs) <= 1:
         A_side = set(pairs.keys()); B_side = set()
@@ -3410,6 +3855,10 @@ def main():
         rep_of, reps, Grep = rep_graph_from_partition(G, pairs, A_side)
         layout_scale = compute_layout_scale(Grep, min_sep=args.min_sep, layout_scale_factor=args.layout_scale_factor)
         reps_pos = layout_reps_scale_aware(Grep, layout_scale=layout_scale, sweeps=args.sweeps, seed=args.seed)
+        if LAYOUT_COMMUNITY_MODEL is not None:
+            reps_pos = apply_kinetic_initialization(
+                Grep, reps_pos, rep_of, LAYOUT_COMMUNITY_MODEL, layout_scale, seed=args.seed
+            )
 
         if args.axis_lateral_gap is not None and args.axis_lateral_gap > 0.0:
             for k, (rx, ry) in list(reps_pos.items()):
@@ -3444,6 +3893,31 @@ def main():
             best_pos = dict(pos)
             print(f"[CENTER] placed requested target at the initial vertical midpoint", flush=True)
 
+        if LAYOUT_COMMUNITY_MODEL is not None:
+            print(
+                "[START] Enforcing full minimum separation before kinetic objective normalization",
+                flush=True,
+            )
+            pos, initial_packed_separation = enforce_minimum_separation_mirror_preserving(
+                pos,
+                pairs,
+                sides,
+                min_sep=args.min_sep,
+                max_iter=max(500, args.final_separation_iters),
+                stall_limit=args.separation_stall_passes,
+            )
+            if initial_packed_separation["remaining_violations"]:
+                raise RuntimeError(
+                    "The kinetic packed initialization could not satisfy the requested minimum "
+                    f"separation: {initial_packed_separation['remaining_violations']} violations remain."
+                )
+            best_pos = dict(pos)
+            print(
+                "[KINETIC COMMUNITY] feasible packed initialization: "
+                f"minimum_distance={initial_packed_separation['minimum_distance']:.6f}",
+                flush=True,
+            )
+
     print("[INFO] Building edge cache for delta crossing computations", flush=True)
     edges_all, edge_bboxes = build_edge_cache(G, pos)
 
@@ -3457,6 +3931,22 @@ def main():
     initial_spacing_penalty = args.objective_reference_spacing_penalty if args.objective_reference_spacing_penalty is not None else resume_start_spacing_penalty
     resume_start_center_penalty = centrality_metrics(best_pos, center_targets)["penalty"]
     initial_center_penalty = args.objective_reference_center_penalty if args.objective_reference_center_penalty is not None else resume_start_center_penalty
+    resume_start_community_stress = kinetic_community_stress(
+        best_pos, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep
+    )
+    initial_community_stress = (
+        args.objective_reference_community_stress
+        if args.objective_reference_community_stress is not None
+        else resume_start_community_stress
+    )
+    resume_start_community_packing = kinetic_packing_penalty(
+        best_pos, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep
+    )
+    initial_community_packing = (
+        args.objective_reference_community_packing
+        if args.objective_reference_community_packing is not None
+        else resume_start_community_packing
+    )
     configure_layout_objective(
         args.objective_mode,
         args.objective_crossing_weight,
@@ -3471,6 +3961,12 @@ def main():
         center_weight=args.center_weight,
         center_targets=center_targets,
         initial_center_penalty=initial_center_penalty,
+        community_weight=args.objective_community_weight,
+        initial_community_stress=initial_community_stress,
+        community_packing_weight=(
+            args.community_packing_weight if LAYOUT_COMMUNITY_MODEL is not None else 0.0
+        ),
+        initial_community_packing=initial_community_packing,
     )
     current_layout_score = evaluate_layout_score(G, best_pos, edges_all, sides=sides, min_sep=args.min_sep)
     print(f"[OBJECTIVE] {OBJECTIVE_CONFIGURATION}", flush=True)
@@ -3485,6 +3981,12 @@ def main():
         "block_flips_accepted": 0,
         "block_pairs_accepted": 0,
         "block_relaxations_accepted": 0,
+        "community_relaxations_attempted": 0,
+        "community_relaxations_accepted": 0,
+        "community_blocks_attempted": 0,
+        "community_blocks_accepted": 0,
+        "community_region_moves_attempted": 0,
+        "community_region_moves_accepted": 0,
     }
     for key, value in resume_state.get("hemisphere_statistics", {}).items():
         if key in hemisphere_totals and key != "mode":
@@ -3607,6 +4109,22 @@ def main():
                 "transactional_valid_cycles": bool(args.transactional_valid_cycles),
                 "edge_objective_scope": args.edge_objective_scope,
                 "edge_weighting": args.edge_weighting,
+                "layout_weight_transform": args.layout_weight_transform,
+                "layout_weight_percentile_power": float(args.layout_weight_percentile_power),
+                "spring_weight_floor_ratio": float(args.spring_weight_floor_ratio),
+                "mirror_energy_tolerance": float(args.mirror_energy_tolerance),
+                "objective_community_weight": float(args.objective_community_weight),
+                "local_equilibrium_gate_floor": float(args.local_equilibrium_gate_floor),
+                "community_model_version": 2,
+                "community_selection": args.community_selection,
+                "community_count": int(args.community_count),
+                "community_max_count": int(args.community_max_count),
+                "community_membership": args.community_membership,
+                "packing_region_max_nodes": int(args.packing_region_max_nodes),
+                "community_packing_weight": float(args.community_packing_weight),
+                "community_packing_anneal_cycles": int(args.community_packing_anneal_cycles),
+                "community_landmarks": int(args.community_landmarks),
+                "kinetic_community_relax_iters": int(args.kinetic_community_relax_iters),
                 "edge_length_power": float(args.edge_length_power),
                 "cross_axis_edge_weight": float(args.cross_axis_edge_weight),
                 "hemisphere_optimization": args.hemisphere_optimization,
@@ -3646,10 +4164,16 @@ def main():
             retained_score = evaluate_layout_score(
                 G, best_pos, edges_all, sides=sides, min_sep=args.min_sep
             )
+            retained_edge = _global_edge_length_score(G, best_pos, edges_all) / _edge_length_scale(args.min_sep)
+            retained_community = kinetic_community_stress(
+                best_pos, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep
+            )
             print(
                 f"[STAGE DIAGNOSTICS] {label}: "
                 f"retained_max_shift={max_node_shift(retained_before, best_pos):.6f} "
                 f"objective={retained_score:.12f} "
+                f"weighted_edge={retained_edge:.9f} "
+                f"community_stress={retained_community:.9f} "
                 f"threshold={active_separation:.6f} "
                 f"violations={retained_diag['remaining_violations']} "
                 f"deficit={retained_diag['total_squared_deficit']:.9f}",
@@ -3665,6 +4189,24 @@ def main():
     for cycle in range(args.refine_cycles):
         global_cycle = args.cycle_offset + cycle + 1
         final_requested_cycle = args.cycle_offset + args.refine_cycles
+        if LAYOUT_COMMUNITY_MODEL is not None:
+            if args.community_packing_anneal_cycles <= 0:
+                packing_fraction = 0.0
+            else:
+                packing_fraction = max(
+                    0.0,
+                    1.0 - float(global_cycle - 1) / float(args.community_packing_anneal_cycles),
+                )
+            LAYOUT_COMMUNITY_PACKING_WEIGHT = (
+                LAYOUT_COMMUNITY_PACKING_BASE_WEIGHT * packing_fraction
+            )
+            OBJECTIVE_CONFIGURATION["effective_community_packing_weight"] = (
+                LAYOUT_COMMUNITY_PACKING_WEIGHT
+            )
+            OBJECTIVE_CONFIGURATION["community_packing_fraction"] = packing_fraction
+            current_layout_score = evaluate_layout_score(
+                G, best_pos, edges_all, sides=sides, min_sep=args.min_sep
+            )
         print(f"[REFINE] cycle {global_cycle}/{final_requested_cycle} starting (current crossings={current_cross})", flush=True)
         cycle_start_pos = dict(best_pos)
         cycle_start_sides = dict(sides)
@@ -3691,6 +4233,12 @@ def main():
             "block_accepted": 0,
             "block_pairs_accepted": 0,
             "block_relaxation_accepted": 0,
+            "community_relaxation_attempted": 0,
+            "community_relaxation_accepted": 0,
+            "community_block_candidates": 0,
+            "community_block_accepted": 0,
+            "community_region_moves_attempted": 0,
+            "community_region_move_accepted": "",
             "transaction_rolled_back": False,
         }
 
@@ -3798,6 +4346,105 @@ def main():
             if verbose:
                 print(f"  [RESULT] achiral-slot swaps no improvement (score={ach_score:.3f}, crossings={ach_cross})", flush=True)
         after_step("achiral-slot swaps", stage_start_pos)
+
+        if LAYOUT_COMMUNITY_MODEL is not None and args.kinetic_community_relax_iters > 0:
+            print(
+                f"[REFINE][cycle {global_cycle}] Step: kinetic-community relaxation "
+                f"(iters={args.kinetic_community_relax_iters})",
+                flush=True,
+            )
+            stage_start_pos = dict(best_pos)
+            hemisphere_totals["community_relaxations_attempted"] += 1
+            cycle_hemisphere["community_relaxation_attempted"] = 1
+            community_blocks = kinetic_community_block_candidates(
+                best_pos, LAYOUT_COMMUNITY_MODEL,
+                max_pairs=args.hemisphere_block_max_pairs, limit=8,
+            )
+            cycle_hemisphere["community_block_candidates"] = len(community_blocks)
+            hemisphere_totals["community_blocks_attempted"] += len(community_blocks)
+            selected_community = None
+            for community_block in community_blocks:
+                community_pos, community_sides, community_diag = relax_kinetic_community(
+                    best_pos, LAYOUT_COMMUNITY_MODEL, pairs, sides,
+                    min_sep=args.min_sep,
+                    iterations=args.kinetic_community_relax_iters,
+                    active_representatives=community_block,
+                )
+                community_score = evaluate_layout_score(
+                    G, community_pos, edges_all, sides=community_sides, min_sep=args.min_sep
+                )
+                if community_score >= current_layout_score:
+                    continue
+                community_pos, separation_ok = prepare_candidate_for_scoring(
+                    best_pos, community_pos, "kinetic-community block relaxation"
+                )
+                community_sides = synchronise_sides_from_positions(community_pos, community_sides)
+                community_score = evaluate_layout_score(
+                    G, community_pos, edges_all, sides=community_sides, min_sep=args.min_sep
+                )
+                if not separation_ok or community_score >= current_layout_score:
+                    continue
+                rank = (community_score, len(community_block), community_block)
+                if selected_community is None or rank < selected_community[0]:
+                    selected_community = (
+                        rank, community_pos, community_sides, community_diag, community_score
+                    )
+            if selected_community is not None:
+                _, community_pos, community_sides, community_diag, community_score = selected_community
+                best_pos, sides = community_pos, community_sides
+                current_layout_score = float(community_score)
+                current_cross = count_edge_crossings(G, best_pos)
+                edges_all, edge_bboxes = build_edge_cache(G, best_pos)
+                improved_cycle = True
+                cycle_hemisphere["community_relaxation_accepted"] = 1
+                cycle_hemisphere["community_block_accepted"] = 1
+                hemisphere_totals["community_relaxations_accepted"] += 1
+                hemisphere_totals["community_blocks_accepted"] += 1
+                print(
+                    f"[KINETIC COMMUNITY][cycle {global_cycle}] accepted relaxation: "
+                    f"moved_representatives={community_diag['moved_representatives']} "
+                    f"objective={current_layout_score:.12f}",
+                    flush=True,
+                )
+            region_proposals = kinetic_community_region_proposals(
+                best_pos, LAYOUT_COMMUNITY_MODEL, pairs, sides,
+                min_sep=args.min_sep, limit=8,
+            )
+            cycle_hemisphere["community_region_moves_attempted"] = len(region_proposals)
+            hemisphere_totals["community_region_moves_attempted"] += len(region_proposals)
+            selected_region = None
+            for move_name, region_pos in region_proposals:
+                region_score = evaluate_layout_score(
+                    G, region_pos, edges_all, sides=sides, min_sep=args.min_sep
+                )
+                if region_score >= current_layout_score:
+                    continue
+                region_pos, separation_ok = prepare_candidate_for_scoring(
+                    best_pos, region_pos, f"kinetic-community {move_name}"
+                )
+                region_score = evaluate_layout_score(
+                    G, region_pos, edges_all, sides=sides, min_sep=args.min_sep
+                )
+                if not separation_ok or region_score >= current_layout_score:
+                    continue
+                rank = (region_score, move_name)
+                if selected_region is None or rank < selected_region[0]:
+                    selected_region = (rank, move_name, region_pos, region_score)
+            if selected_region is not None:
+                _, move_name, region_pos, region_score = selected_region
+                best_pos = region_pos
+                sides = synchronise_sides_from_positions(best_pos, sides)
+                current_layout_score = float(region_score)
+                current_cross = count_edge_crossings(G, best_pos)
+                edges_all, edge_bboxes = build_edge_cache(G, best_pos)
+                improved_cycle = True
+                cycle_hemisphere["community_region_move_accepted"] = move_name
+                hemisphere_totals["community_region_moves_accepted"] += 1
+                print(
+                    f"[KINETIC COMMUNITY][cycle {global_cycle}] accepted {move_name}: "
+                    f"objective={current_layout_score:.12f}", flush=True,
+                )
+            after_step("kinetic-community relaxation", stage_start_pos)
 
         print(f"[REFINE][cycle {global_cycle}] Step: pair-block relocation (max_trials={args.pair_relocation_trials})", flush=True)
         stage_start_pos = dict(best_pos)
@@ -4047,6 +4694,38 @@ def main():
                             f"active_pairs={relax_diag['active_pairs']} objective={current_layout_score:.12f}",
                             flush=True,
                         )
+                if LAYOUT_COMMUNITY_MODEL is not None and args.kinetic_community_relax_iters > 0:
+                    hemisphere_totals["community_relaxations_attempted"] += 1
+                    cycle_hemisphere["community_relaxation_attempted"] += 1
+                    community_pos, community_sides, community_diag = relax_kinetic_community(
+                        best_pos, LAYOUT_COMMUNITY_MODEL, pairs, sides,
+                        min_sep=args.min_sep, iterations=args.kinetic_community_relax_iters,
+                        active_representatives=block_ids,
+                    )
+                    separation_ok = True
+                    if args.separation_mode == "progressive":
+                        community_pos, _, _, separation_ok = project_candidate_for_separation(
+                            best_pos, community_pos, pairs, community_sides, active_separation,
+                            max_iter=args.separation_project_iters,
+                            stall_limit=args.separation_stall_passes,
+                        )
+                        community_sides = synchronise_sides_from_positions(community_pos, community_sides)
+                    community_score = evaluate_layout_score(
+                        G, community_pos, edges_all, sides=community_sides, min_sep=args.min_sep
+                    )
+                    if separation_ok and community_score < current_layout_score - 1e-12:
+                        best_pos, sides = community_pos, community_sides
+                        current_layout_score = community_score
+                        current_cross = count_edge_crossings(G, best_pos)
+                        edges_all, edge_bboxes = build_edge_cache(G, best_pos)
+                        cycle_hemisphere["community_relaxation_accepted"] += 1
+                        hemisphere_totals["community_relaxations_accepted"] += 1
+                        print(
+                            f"[KINETIC COMMUNITY][cycle {global_cycle}] accepted post-block relaxation: "
+                            f"moved_representatives={community_diag['moved_representatives']} "
+                            f"objective={current_layout_score:.12f}",
+                            flush=True,
+                        )
             after_step("adaptive hemisphere optimisation", stage_start_pos)
 
         stage_start_pos = dict(best_pos)
@@ -4219,6 +4898,26 @@ def main():
             "hemisphere": dict(cycle_hemisphere),
             **span_metrics,
         }
+        if KINETIC_COMMUNITY_AVAILABLE:
+            cycle_record.update({
+                "kinetic_community_stress": kinetic_community_stress(
+                    best_pos, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep
+                ),
+                "kinetic_community_fraction_of_initial": (
+                    kinetic_community_stress(best_pos, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep)
+                    / max(float(initial_community_stress), 1e-12)
+                    if LAYOUT_COMMUNITY_MODEL is not None else 0.0
+                ),
+                "kinetic_community_packing_penalty": kinetic_packing_penalty(
+                    best_pos, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep
+                ),
+                "kinetic_community_packing_fraction_of_initial": (
+                    kinetic_packing_penalty(best_pos, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep)
+                    / max(float(initial_community_packing), 1e-12)
+                    if LAYOUT_COMMUNITY_MODEL is not None else 0.0
+                ),
+                "kinetic_community_packing_active_weight": LAYOUT_COMMUNITY_PACKING_WEIGHT,
+            })
         cycle_metrics.append(cycle_record)
         print(f"[CYCLE METRICS] {cycle_record}", flush=True)
 
@@ -4411,6 +5110,12 @@ def main():
     print(f"[FINAL] crossings after all refinements = {final_cross}", flush=True)
 
     final_weighted_length = _global_edge_length_score(G, pos_final, edges_all) / _edge_length_scale(args.min_sep)
+    final_community_stress = kinetic_community_stress(
+        pos_final, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep
+    )
+    final_community_packing = kinetic_packing_penalty(
+        pos_final, LAYOUT_COMMUNITY_MODEL, min_sep=args.min_sep
+    )
     final_center_metrics = centrality_metrics(pos_final, center_targets)
     final_cross_axis_fraction = _global_cross_axis_penalty(
         G, pos_final, edges_all, sides
@@ -4464,6 +5169,14 @@ def main():
         "separation": separation_diag,
         "cycles": cycle_metrics,
     }
+    if KINETIC_COMMUNITY_AVAILABLE:
+        run_metrics.update({
+            "initial_kinetic_community_stress": initial_community_stress,
+            "final_kinetic_community_stress": final_community_stress,
+            "initial_kinetic_community_packing": initial_community_packing,
+            "final_kinetic_community_packing": final_community_packing,
+            "kinetic_community": None if LAYOUT_COMMUNITY_MODEL is None else LAYOUT_COMMUNITY_MODEL["report"],
+        })
     print(f"[METRICS] {run_metrics}", flush=True)
     if args.out_metrics_json:
         Path(args.out_metrics_json).parent.mkdir(parents=True, exist_ok=True)
@@ -4501,17 +5214,27 @@ LAYOUT_CROSS_AXIS_WEIGHT = 0.0
 LAYOUT_CENTER_WEIGHT = 0.0
 LAYOUT_CENTER_TARGETS = tuple()
 LAYOUT_CENTER_REFERENCE = 0.01
+LAYOUT_COMMUNITY_WEIGHT = 0.0
+LAYOUT_COMMUNITY_PACKING_WEIGHT = 0.0
+LAYOUT_COMMUNITY_PACKING_BASE_WEIGHT = 0.0
+LAYOUT_COMMUNITY_PACKING_REFERENCE = 1.0
+LAYOUT_COMMUNITY_MODEL = None
 OBJECTIVE_CONFIGURATION = {"mode": "legacy"}
 
 
 def configure_layout_objective(mode, crossing_weight, edge_length_weight, spacing_weight, soft_sep_factor,
                                initial_crossings=None, initial_weighted_length=None, initial_spacing_penalty=None,
                                edge_length_power=1.0, cross_axis_weight=0.0,
-                               center_weight=0.0, center_targets=(), initial_center_penalty=None):
+                               center_weight=0.0, center_targets=(), initial_center_penalty=None,
+                               community_weight=0.0, initial_community_stress=None,
+                               community_packing_weight=0.0, initial_community_packing=None):
     """Configure comparable objective terms for a single layout run."""
     global LAYOUT_CROSSING_WEIGHT, LAYOUT_EDGE_LENGTH_WEIGHT, LAYOUT_SPACING_WEIGHT, LAYOUT_SOFT_SEP_FACTOR
     global LAYOUT_EDGE_LENGTH_POWER, LAYOUT_CROSS_AXIS_WEIGHT, LAYOUT_CENTER_WEIGHT
-    global LAYOUT_CENTER_TARGETS, LAYOUT_CENTER_REFERENCE, OBJECTIVE_CONFIGURATION
+    global LAYOUT_CENTER_TARGETS, LAYOUT_CENTER_REFERENCE, LAYOUT_COMMUNITY_WEIGHT
+    global LAYOUT_COMMUNITY_PACKING_WEIGHT, LAYOUT_COMMUNITY_PACKING_BASE_WEIGHT
+    global LAYOUT_COMMUNITY_PACKING_REFERENCE
+    global OBJECTIVE_CONFIGURATION
     mode = str(mode).strip().lower()
     if mode not in {"legacy", "initial_normalized"}:
         raise ValueError("objective mode must be 'legacy' or 'initial_normalized'.")
@@ -4534,8 +5257,15 @@ def configure_layout_objective(mode, crossing_weight, edge_length_weight, spacin
     LAYOUT_CENTER_REFERENCE = max(float(initial_center_penalty or 0.0), 0.01)
     if mode == "initial_normalized":
         LAYOUT_CENTER_WEIGHT = float(center_weight) / LAYOUT_CENTER_REFERENCE
+        LAYOUT_COMMUNITY_WEIGHT = float(community_weight) / max(float(initial_community_stress or 0.0), 1e-12)
+        LAYOUT_COMMUNITY_PACKING_REFERENCE = max(float(initial_community_packing or 0.0), 1e-12)
+        LAYOUT_COMMUNITY_PACKING_BASE_WEIGHT = float(community_packing_weight) / LAYOUT_COMMUNITY_PACKING_REFERENCE
     else:
         LAYOUT_CENTER_WEIGHT = float(center_weight)
+        LAYOUT_COMMUNITY_WEIGHT = float(community_weight)
+        LAYOUT_COMMUNITY_PACKING_REFERENCE = 1.0
+        LAYOUT_COMMUNITY_PACKING_BASE_WEIGHT = float(community_packing_weight)
+    LAYOUT_COMMUNITY_PACKING_WEIGHT = LAYOUT_COMMUNITY_PACKING_BASE_WEIGHT
     OBJECTIVE_CONFIGURATION = {
         "mode": mode,
         "requested_crossing_weight": float(crossing_weight),
@@ -4556,6 +5286,59 @@ def configure_layout_objective(mode, crossing_weight, edge_length_weight, spacin
         "center_targets": list(LAYOUT_CENTER_TARGETS),
         "edge_objective_scope": LAYOUT_EDGE_OBJECTIVE_SCOPE,
     }
+    if KINETIC_COMMUNITY_AVAILABLE:
+        OBJECTIVE_CONFIGURATION.update({
+            "community_weight": float(community_weight),
+            "community_packing_weight": float(community_packing_weight),
+            "initial_community_stress": None if initial_community_stress is None else float(initial_community_stress),
+            "initial_community_packing": None if initial_community_packing is None else float(initial_community_packing),
+            "effective_community_weight": LAYOUT_COMMUNITY_WEIGHT,
+            "effective_community_packing_weight": LAYOUT_COMMUNITY_PACKING_WEIGHT,
+        })
+
+
+def kinetic_community_stress(pos, model=None, min_sep=60.0):
+    """Full-state sparse reversible diffusion-distance stress."""
+    if model is None:
+        model = LAYOUT_COMMUNITY_MODEL
+    if not model:
+        return 0.0
+    return _kinetic_community_module().stress(pos, model, min_sep=min_sep)
+
+
+def kinetic_packing_penalty(pos, model=None, min_sep=60.0):
+    """Temporary within-region packing penalty used only during annealing."""
+    if model is None:
+        model = LAYOUT_COMMUNITY_MODEL
+    if not model:
+        return 0.0
+    return _kinetic_community_module().packing_penalty(pos, model, min_sep=min_sep)
+
+
+def relax_kinetic_community(
+    pos, model, pairs, sides, min_sep=60.0, iterations=5, active_representatives=None
+):
+    """Propose mirror-preserving movement against full-state kinetic stress."""
+    work, updated_sides, diagnostics = _kinetic_community_module().relax(
+        pos, model, pairs, sides, min_sep=min_sep, iterations=iterations,
+        active_nodes=active_representatives,
+    )
+    diagnostics["moved_representatives"] = diagnostics.get("moved_nodes", 0)
+    return work, updated_sides, diagnostics
+
+
+def kinetic_community_block_candidates(pos, model, max_pairs=128, limit=8):
+    """Return the highest-residual connected packing-region proposals."""
+    return _kinetic_community_module().block_candidates(
+        pos, model, max_nodes=max_pairs, limit=limit
+    )
+
+
+def kinetic_community_region_proposals(pos, model, pairs, sides, min_sep=60.0, limit=8):
+    """Propose coherent region translation, reshaping, ordering and boundary moves."""
+    return _kinetic_community_module().region_move_proposals(
+        pos, model, pairs, sides, min_sep=min_sep, limit=limit
+    )
 
 
 def edge_in_length_objective(G, u, v):
@@ -4760,6 +5543,8 @@ def evaluate_layout_score(G, pos, edges_all, sides=None, min_sep=40.0,
     axis_score = _axis_gap_penalty(pos, sides) if sides else 0.0
     cross_axis_score = _global_cross_axis_penalty(G, pos, edges_all, sides) if sides else 0.0
     center_score = centrality_metrics(pos, LAYOUT_CENTER_TARGETS)["penalty"]
+    community_score = kinetic_community_stress(pos, min_sep=min_sep)
+    packing_score = kinetic_packing_penalty(pos, min_sep=min_sep)
     return (
         crossing_weight * float(crossings)
         + edge_length_weight * float(edge_score)
@@ -4767,6 +5552,8 @@ def evaluate_layout_score(G, pos, edges_all, sides=None, min_sep=40.0,
         + axis_gap_weight * float(axis_score)
         + LAYOUT_CROSS_AXIS_WEIGHT * float(cross_axis_score)
         + LAYOUT_CENTER_WEIGHT * float(center_score)
+        + LAYOUT_COMMUNITY_WEIGHT * float(community_score)
+        + LAYOUT_COMMUNITY_PACKING_WEIGHT * float(packing_score)
     )
 
 
@@ -5658,7 +6445,7 @@ def adaptive_block_candidates(G, pos, sides, pairs, uniform=False, max_pairs=128
             continue
         weight = _orientation_edge_weight(G, u, v, uniform=uniform)
         distance = math.hypot(float(pos[u][0]) - float(pos[v][0]), float(pos[u][1]) - float(pos[v][1]))
-        costly.append((-(weight * distance), str(pu), str(pv), pu, pv))
+        costly.append((-(weight * (distance ** LAYOUT_EDGE_LENGTH_POWER)), str(pu), str(pv), pu, pv))
     seed_edges = []
     seen_seed = set()
     for _, _, _, pu, pv in sorted(costly):
