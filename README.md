@@ -1,130 +1,131 @@
 # BVGraph: mirror-preserving layouts for bullvalene isomer networks
 
-BVGraph generates symmetry-aware two- and three-dimensional layouts for
-bullvalene isomer networks.  It is designed for barcode-labelled networks that
-contain achiral isomers and pairs of enantiomeric isomers.
+BVGraph generates symmetry-aware layouts for bullvalene isomer graphs.
 
-`BVGraph2D.py` creates a two-dimensional layout with exact left/right mirror
-symmetry.  `BVGraph3D.py` converts a completed two-dimensional layout into a
-mirror-preserving three-dimensional embedding.
+- `BVGraph2D.py` produces a 2D layout in which enantiomeric nodes are exact left/right mirror partners and achiral nodes lie on a central axis.
+- `BVGraph3D.py` converts a completed 2D layout to a mirror-symmetric 3D embedding.
 
-## Contents
+BVGraph2D is topological and unweighted by default. Optional edge weighting can make short connections preferentially represent low-energy equilibrium exchange or high transient population flux.
 
-- `BVGraph2D.py` — two-dimensional layout generator.
-- `BVGraph3D.py` — three-dimensional embedding generator.
-- `README_BVGraph2D.txt` — detailed two-dimensional input, method, and option
-  reference.
-- `README_BVGraph3D.txt` — detailed three-dimensional usage reference.
-- `example/0000001123/` — example input and output files.
-- `CITATION.cff` and `LICENSE` — citation metadata and MIT license.
+## Package contents
 
-## Installation
+- `BVGraph2D.py`: 2D layout generation and optimisation
+- `BVGraph3D.py`: 2D-to-3D conversion
+- `README_BVGraph2D.txt`: complete 2D input, method, option, restart, and output reference
+- `README_BVGraph3D.txt`: 3D usage guide
+- `example/0000001123/`: established unweighted example
+- `CITATION.cff`: citation metadata
+- `LICENSE`: MIT licence
 
-Python 3.8 or later is required.  Install the packages used by the 2D workflow:
+## Dependencies
 
 ```bash
 pip install networkx numpy pandas
 ```
 
-SciPy is required for the NetworkX spring-layout calculation on larger graphs.
-SciPy and Numba are optional accelerators for larger 3D calculations:
+SciPy and Numba are recommended for larger 3D layouts. The separate unpublished kinetics preview also requires SciPy.
 
-```bash
-pip install scipy numba
+## Inputs
+
+BVGraph2D reads a nodes CSV containing `id` and an edges CSV containing `source` and `target` (case-insensitive; `s` and `t` are also accepted). An optional `Energy` or `Relative Energy (kJ/mol)` node column is retained as metadata. Node identifiers are interpreted as bullvalene barcodes to determine canonical rotations, chirality, and enantiomer partners.
+
+### Optional equilibrium-exchange weighting
+
+Use `--edge-weighting equilibrium-exchange` with an edge column named `Relative TS Energy (kJ/mol)` by default. These values are Gibbs free energies of transition states on a common reference scale. For each undirected topological edge, the lowest finite transition-state energy among duplicate or parallel input records is used.
+
+The raw attraction is:
+
+```text
+r_e = f + (1-f) exp[-(E_TS,e - E_TS,min)/(RT)]
 ```
 
-## Input files
+Lower absolute transition-state free energies therefore receive stronger springs, as appropriate for emphasizing equilibrium exchange traffic. Node energies are not used in this layout weighting.
 
-`BVGraph2D.py` reads a node CSV and an edge CSV.
+### Optional transient-flux weighting
 
-- The node table requires `id` and may contain an `Energy` column plus existing
-  barcode or enantiomer annotations.
-- The edge table requires `Source` and `Target` columns, matched
-  case-insensitively.  `s` and `t` are accepted aliases.
+Use `--edge-weighting transient-flux --transient-flux-file flux.csv`. The flux file contains one undirected edge per row:
 
-Barcode annotations, chirality, and enantiomer partners are derived from the
-node IDs before the layout is constructed.  Any matching annotation columns in
-the node table are retained as graph attributes.
+```text
+source,target,Integrated Absolute Net Flux,Integrated Gross Flux,Integrated Signed Net Flux,Flux Data Status
+```
 
-## Standard 2D and 3D workflow
+Select `--transient-flux-metric absolute-net` (the default) or `gross`. Absolute net flux emphasizes directed redistribution of population; gross flux emphasizes all forward-plus-reverse reaction traffic. BVGraph uses the selected integrated flux directly:
 
-Create a 2D layout:
+```text
+r_e = f + (1-f) F_e/F_max
+```
+
+No second Boltzmann transformation is applied. A valid zero-flux edge receives the floor attraction. An unavailable edge remains explicitly distinguished from a measured zero.
+
+For both modes, `f` is `--spring-weight-floor-ratio` (default 0.05). Non-self-loop spring weights are normalized to mean one. Weighting affects the initial NetworkX spring embedding and every subsequent weighted edge-length term; it does not prescribe absolute edge lengths. Self-loops retain metadata but do not exert geometric attraction.
+
+## Standard workflow
+
+Generate an unweighted 2D layout:
 
 ```bash
 python BVGraph2D.py \
   --nodes example/0000001123/nodes.csv \
   --edges example/0000001123/edges.csv \
-  --out example/0000001123/my_layout.gexf \
-  --out-xgmml example/0000001123/my_layout.xgmml \
-  --out-nodes-csv example/0000001123/nodes_coords.csv \
-  --out-edges-csv example/0000001123/edges_out.csv \
-  --verbose
+  --out layout.gexf \
+  --out-xgmml layout.xgmml \
+  --out-nodes-csv nodes_coordinates.csv \
+  --out-edges-csv edge_metadata.csv
 ```
 
-Create a 3D embedding from that layout:
-
-```bash
-python BVGraph3D.py \
-  --input example/0000001123/my_layout.gexf \
-  --output example/0000001123/my_layout_3d.gexf \
-  --nodes example/0000001123/nodes.csv \
-  --verbose
-```
-
-## Energy-aware 2D layouts
-
-When constructing a new layout (rather than resuming coordinates), BVGraph2D
-uses a topological NetworkX spring layout and treats all non-self-loop edges
-uniformly in its geometric edge-length term by default. If transition-state
-energies are available, Boltzmann weighting can make lower-barrier connections
-exert stronger relative attraction.
-
-For `--edge-weighting boltzmann`, provide the following default columns:
-
-- node CSV: `Relative Energy (kJ/mol)`
-- edge CSV: `Relative TS Energy (kJ/mol)`
-
-Both columns must be in kJ mol⁻¹ and share the globally lowest-energy
-ground-state node as their zero.  For an edge between `u` and `v`, BVGraph2D
-uses the activation barrier:
-
-```text
-B = E_TS - min(E_u, E_v)
-```
-
-Run an energy-aware layout with:
+Generate an equilibrium-exchange layout:
 
 ```bash
 python BVGraph2D.py \
   --nodes nodes.csv \
   --edges edges.csv \
-  --out weighted_layout.gexf \
-  --out-edges-csv weighted_edges.csv \
-  --edge-weighting boltzmann \
-  --temperature-k 298.15 \
-  --spring-weight-floor-ratio 0.05 \
-  --verbose
+  --out equilibrium_layout.gexf \
+  --edge-weighting equilibrium-exchange \
+  --edge-objective-scope weighted-data \
+  --temperature-k 298.15
 ```
 
-Without `--edge-weighting boltzmann`, energy columns are retained as metadata
-when present but do not guide the initial spring layout or layout objective.
-The detailed 2D guide describes validation, missing-energy handling, objective
-weights, progressive separation, checkpointing, and all exports.
+Generate a transient absolute-net-flux layout:
+
+```bash
+python BVGraph2D.py \
+  --nodes nodes.csv \
+  --edges edges.csv \
+  --out transient_layout.gexf \
+  --edge-weighting transient-flux \
+  --transient-flux-file transient_flux_edges.csv \
+  --transient-flux-metric absolute-net \
+  --edge-objective-scope weighted-data
+```
+
+Convert a completed 2D layout to 3D:
+
+```bash
+python BVGraph3D.py --input layout.gexf --output layout_3d.gexf --nodes nodes.csv
+```
+
+BVGraph3D accepts weighted and unweighted BVGraph2D outputs without changing its 3D method.
+
+## Layout method
+
+BVGraph2D builds a simple undirected graph and selects one representative from each enantiomeric pair. NetworkX supplies a balanced spring layout of the representative graph. In weighted modes, `Layout_Spring_Weight` is active in this first embedding. The full graph is reconstructed by exact mirroring, and achiral nodes are arranged as connected blocks on the central axis.
+
+Iterative, symmetry-preserving move classes then minimise a combined objective containing edge crossings, edge length, and soft-spacing penalties. With `--objective-mode initial_normalized`, the terms are divided by their starting values before the requested coefficients are applied. `--edge-objective-scope weighted-data` limits edge-length scoring to edges having valid mode-specific data; unavailable edges remain as floor-strength springs in the initial embedding.
+
+The default `--hemisphere-optimization local` uses individual-pair and pair-of-pairs moves. `global` additionally examines side assignments across the complete graph after mirroring. `adaptive` repeats those whole-graph passes and tests connected blocks of enantiomeric pairs, followed by damped mirror-preserving relaxation of accepted blocks and their immediate neighbourhood. Weighted layouts rank these proposals using their active equilibrium or flux weights; unweighted layouts use equal edge importance. Every proposal is accepted against the complete active objective, so crossings, spacing and any central-isomer preference remain in force.
+
+`--center-isomer BARCODE` (also `--centre-isomer`) softly places a selected achiral node, or both members of a selected chiral enantiomeric pair, at the vertical midpoint. The default coefficient is 0.10 when a target is supplied and is inactive otherwise. This affects only the y coordinate: chirality and mirror symmetry continue to determine x. Optional `--edge-length-power` and `--cross-axis-edge-weight` controls can place extra emphasis on long edges or chiral–chiral edges spanning the axis; their neutral defaults are 1.0 and 0.0.
+
+Crossings may be counted exactly or estimated from sampled edge pairs. Dense layouts can progressively raise a mirror-preserving separation threshold. Spatially indexed projection avoids testing every node pair, and the final export is refused unless the requested hard minimum separation is satisfied with exact mirror symmetry. Edge clearance and achiral-axis constraints remain independent of energy or flux weighting.
+
+Vertical span balancing is configurable. `--hemi-span-adjustment expand-smaller` proposes expansion of the shorter axis or chiral group, whereas `compress-larger` proposes contraction of the taller group; refinement accepts either only when the complete active objective improves. The default final chiral-span expansion can be disabled with `--final-span-expansion off` to preserve the objective-optimised coordinates through export. Hard separation and exact mirror validation remain active in either mode.
+
+Long jobs support atomic GEXF/JSON checkpoints, best-layout checkpoints, deterministic cycle numbering, resumption, transactional valid cycles, stage diagnostics, convergence patience, and an optional clean wall-clock limit. Short unique temporary filenames, Windows extended-length paths and automatic recreation make checkpoint writes robust to deep folders, transient missing-file conditions and Windows locks. See `README_BVGraph2D.txt` for full details.
 
 ## Outputs
 
-BVGraph2D writes a GEXF layout with `viz:position` coordinates.  Optional
-outputs include Cytoscape-compatible XGMML, node-coordinate CSV, edge-metadata
-CSV, barcode annotations, side assignments, checkpoint GEXF files, restart
-JSON, and a best-layout checkpoint.
+BVGraph2D writes GEXF and optionally XGMML, node-coordinate CSV, edge-metadata CSV, annotated-node CSV, side assignments, metrics JSON, and restart checkpoints. Edge exports include the weighting mode and metric, mode-specific input value and availability status, supplied flux measures, selected transition-state energy, normalized spring weight, source-row count, final cross-axis status and hemisphere mode. Node exports mark any central target. Metrics record central offset and accepted orientation/block statistics.
 
-In Boltzmann mode, exported edges include the selected relative TS energy,
-activation barrier, energy-data status, normalized layout spring weight, and
-number of merged input edge rows.  BVGraph3D writes a GEXF containing node
-`x`, `y`, and `z` attributes and three-dimensional `viz:position` coordinates.
+## Citation and licence
 
-## Citation and license
-
-Please cite the associated publication and/or use `CITATION.cff` when
-referencing this software.  BVGraph is distributed under the MIT license in
-`LICENSE`.
+Use `CITATION.cff` when citing the software. BVGraph is distributed under the MIT licence in `LICENSE`.
